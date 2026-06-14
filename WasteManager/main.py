@@ -197,7 +197,7 @@ def read_dht11_detailed():
 # ==========================================
 def get_ultrasonic_distance():
     """
-    gpiod v2.x request_lines 방식을 기반으로 초음파 센서로부터 거리를 계산하여 cm 단위로 반환.
+    gpiod v2.x request_lines 방식을 기반으로 초음파 센서로부터 거리를 계산하여 cm 단위로 반환
     """
     try:
         with gpiod.request_lines(
@@ -213,7 +213,7 @@ def get_ultrasonic_distance():
             lines.set_value(TRIG_PIN, Value.INACTIVE)
             time.sleep(0.05)  # 50ms 대기 (통합 대기 지연 최적화)
             
-            # 2. Trigger 핀에 10us의 High(1) 펄스 인가
+            # 2. Trigger 핀에 10us of High(1) 펄스 인가
             lines.set_value(TRIG_PIN, Value.ACTIVE)
             time.sleep(0.00001)
             lines.set_value(TRIG_PIN, Value.INACTIVE)
@@ -250,16 +250,16 @@ def get_ultrasonic_distance():
 # ==========================================
 def initialize_ai_model():
     """
-    NCNN 기반 가속 모델 우선 로드, 없을 경우 PT 모델을 컴파일하여 내보냄.
+    NCNN 기반 가속 모델을 우선적으로 로드하고, 없을 경우 PT 모델을 컴파일하여 내보냅니다.
     """
     print("\n[AI 모델 초기화] 가중치 로드 시도 중...")
     if os.path.exists(NCNN_MODEL_DIR):
         print(f" -> NCNN 가속 모델 발견: '{NCNN_MODEL_DIR}' 디렉토리 로드 완료.")
         return YOLO(NCNN_MODEL_DIR)
         
-    print(f" -> NCNN 모델을 찾을 수 없음. 베이스 모델 '{PT_MODEL_PATH}'로 컴파일 준비.")
+    print(f" -> NCNN 모델을 찾을 수 없어 베이스 모델 '{PT_MODEL_PATH}'로 컴파일을 준비합니다.")
     if not os.path.exists(PT_MODEL_PATH):
-        print(f" -> 로컬에 '{PT_MODEL_PATH}'가 존재하지 않음. 라이브 다운로드 구성.")
+        print(f" -> 로컬에 '{PT_MODEL_PATH}'가 존재하지 않습니다. 라이브 다운로드를 구성합니다.")
         
     try:
         model = YOLO(PT_MODEL_PATH)
@@ -268,7 +268,7 @@ def initialize_ai_model():
         print(" -> NCNN 가속화 변환 성공!")
         return YOLO(NCNN_MODEL_DIR)
     except Exception as e:
-        print(f"❌ AI 모델 로드 실패: {e}")
+        print(f"AI 모델 로드 실패: {e}")
         return None
 
 # ==========================================
@@ -276,7 +276,7 @@ def initialize_ai_model():
 # ==========================================
 def main():
     print("=" * 60)
-    print("AIoT 스마트 분리수거 시스템 - 3단계: 상태 기계 & YOLO 분석 추가")
+    print("AIoT 스마트 분리수거 시스템 - 3단계 상태 기계 & YOLO 통합")
     print("=" * 60)
     
     # 7-1. LCD 하드웨어 초기화
@@ -309,6 +309,12 @@ def main():
     current_state = STATE_IDLE
     last_dht_time = 0      # 온습도 출력 제한용 타이머 (3초 주기)
     
+    # 비차단(Non-blocking) 타이밍 제어용 전역 변수들
+    state_entry_time = 0
+    result_displayed = False
+    success_item_name = ""
+    error_reason = ""
+    
     # 쓰레기를 먼저 배치한 후 센서에 접근하는 사용자 행동 유도 가이드 명시
     lcd.display_text("PLACE WASTE FIRST", lcd.LCD_LINE_1)
     lcd.display_text("APPROACH TO TRIG", lcd.LCD_LINE_2)
@@ -328,7 +334,7 @@ def main():
                     temp, hum, status = read_dht11_detailed()
                     now_str = datetime.now().strftime('%H:%M:%S')
                     if status == "SUCCESS":
-                        print(f"[{now_str}] 내부 온도: {temp}°C | 내부 습도: {hum}% [정상 위생 모니터링 중]")
+                        print(f"[{now_str}] 내부 온도: {temp}°C | 내부 습도: {hum}%")
                     else:
                         print(f"[{now_str}] 온습도 감지 대기 중 (원인: {status})")
                     last_dht_time = current_time
@@ -336,7 +342,7 @@ def main():
                 # 초음파를 통해 쓰레기가 아닌 '사용자의 접근(손/몸)' 감지
                 dist = get_ultrasonic_distance()
                 if 0.0 < dist <= 7.0:
-                    print(f"\n[사용자 접근 감지] {dist}cm에 사용자 감지! 즉시 카메라 캡처를 실행합니다.")
+                    print(f"\n[사용자 접근 감지] {dist}cm에 사용자 감지. 즉시 카메라 캡처를 실행합니다.")
                     current_state = STATE_SCANNING
 
             # ==========================================
@@ -362,6 +368,8 @@ def main():
                     print(f" 카메라 캡처 중 하드웨어 장애 발생: {e}")
                     current_state = STATE_RESULT_ERROR
                     error_reason = "SYSTEM_FAULT"
+                    state_entry_time = time.time()
+                    result_displayed = False
                     continue
                 
                 print(" -> YOLO NCNN 엣지 인공지능 패킷 분석 작동...")
@@ -385,6 +393,8 @@ def main():
                         print(f" -> 탐지 성공: '{detected_item}' (신뢰도: {max_conf * 100:.1f}%)")
                         current_state = STATE_RESULT_SUCCESS
                         success_item_name = detected_item
+                        state_entry_time = time.time()
+                        result_displayed = False
                     else:
                         # 신뢰도 미달 혹은 객체 없음 분류
                         if len(results) > 0 and len(results[0].boxes) > 0:
@@ -395,80 +405,105 @@ def main():
                             print(" -> 탐지 실패: 배출 영역 내에 쓰레기 데이터가 감지되지 않았습니다.")
                             current_state = STATE_RESULT_ERROR
                             error_reason = "NO_OBJECT"
+                        state_entry_time = time.time()
+                        result_displayed = False
                             
                 except Exception as e:
                     print(f" YOLO 인퍼런스 엔진 가동 중 심각한 예외 발생: {e}")
                     current_state = STATE_RESULT_ERROR
                     error_reason = "SYSTEM_FAULT"
+                    state_entry_time = time.time()
+                    result_displayed = False
 
             # ==========================================
-            # [상태 3] STATE_RESULT_SUCCESS: 탐지 성공 및 분류 가이드
+            # [상태 3] STATE_RESULT_SUCCESS: 탐지 성공 및 종류별 '올바른 전처리 가이드' 제공 (비차단형 구현)
             # ==========================================
             elif current_state == STATE_RESULT_SUCCESS:
-                lcd.clear()
-                
-                # WasteDetector 및 일반 스마트 재활용의 다중 클래스별 LCD 특수 메시지 1:1 디스패치
-                if "bottle" in success_item_name or "plastic" in success_item_name:
-                    lcd.display_text("PLASTIC BOTTLE", lcd.LCD_LINE_1)
-                    lcd.display_text("REMOVE CAP&LABEL", lcd.LCD_LINE_2)
-                    print("가이드: [플라스틱] 비닐 라벨과 플라스틱 뚜껑을 완전히 떼어내고 압착해야합니다.")
-                elif "can" in success_item_name or "metal" in success_item_name:
-                    lcd.display_text("CAN & METAL WST", lcd.LCD_LINE_1)
-                    lcd.display_text("EMPTY & FLATTEN", lcd.LCD_LINE_2)
-                    print("가이드: [캔/메탈] 내부 잔여물을 깨끗이 비우고 찌그러뜨려야합니다.")
-                elif "paper" in success_item_name or "cardboard" in success_item_name:
-                    lcd.display_text("PAPER / BOX WST", lcd.LCD_LINE_1)
-                    lcd.display_text("REMOVE TAPE&FOLD", lcd.LCD_LINE_2)
-                    print("가이드: [종이류] 박스의 비닐 테이프와 이물질을 완전히 뜯고 평평하게 접어야합니다.")
-                elif "glass" in success_item_name:
-                    lcd.display_text("GLASS BOTTLE", lcd.LCD_LINE_1)
-                    lcd.display_text("RINSE WITH WATER", lcd.LCD_LINE_2)
-                    print("가이드: [유리병] 내용물을 가볍게 헹군 뒤 깨지지 않도록 배출해야합니다.")
-                else:
-                    # Trash / General Waste / Cardboard 등 기타 일반 쓰레기 매핑
-                    lcd.display_text("GENERAL TRASH", lcd.LCD_LINE_1)
-                    lcd.display_text("PUT IN THE BIN", lcd.LCD_LINE_2)
-                    print("가이드: [일반/기타] 별도 재활용이 곤란한 재질이므로 수거함에 그대로 배출해 주세요.")
+                if not result_displayed:
+                    lcd.clear()
+                    # 수거함은 단 하나이므로, 쓰레기 종류별 "분리배출 요령(전처리 행동)"을 동적으로 제공
+                    if "bottle" in success_item_name or "plastic" in success_item_name:
+                        lcd.display_text("PLASTIC BOTTLE", lcd.LCD_LINE_1)
+                        lcd.display_text("REMOVE CAP&LABEL", lcd.LCD_LINE_2)
+                        print("가이드: [플라스틱] 비닐 라벨과 플라스틱 뚜껑을 완전히 떼어내고 압착해야합니다.")
+                    elif "can" in success_item_name or "metal" in success_item_name:
+                        lcd.display_text("CAN & METAL WST", lcd.LCD_LINE_1)
+                        lcd.display_text("EMPTY & FLATTEN", lcd.LCD_LINE_2)
+                        print("가이드: [캔/메탈] 내부 잔여물을 깨끗이 비우고 찌그러뜨려야합니다.")
+                    elif "paper" in success_item_name or "cardboard" in success_item_name:
+                        lcd.display_text("PAPER / BOX WST", lcd.LCD_LINE_1)
+                        lcd.display_text("REMOVE TAPE&FOLD", lcd.LCD_LINE_2)
+                        print("가이드: [종이류] 박스의 비닐 테이프와 이물질을 완전히 뜯고 평평하게 접어야합니다.")
+                    elif "glass" in success_item_name:
+                        lcd.display_text("GLASS BOTTLE", lcd.LCD_LINE_1)
+                        lcd.display_text("RINSE WITH WATER", lcd.LCD_LINE_2)
+                        print("가이드: [유리병] 내용물을 가볍게 헹군 뒤 깨지지 않도록 수거해야합니다.")
+                    else:
+                        lcd.display_text("GENERAL TRASH", lcd.LCD_LINE_1)
+                        lcd.display_text("PUT IN THE BIN", lcd.LCD_LINE_2)
+                        print("가이드: [일반/기타] 별도 재활용이 곤란한 재질이므로 수거함에 그대로 배출해 주세요.")
+                    
+                    print(" -> 시스템 배출 가이드 제공 시작 (비차단식 5초 버퍼 가동)")
+                    result_displayed = True
 
-                print(" -> 시스템 쿨다운 버퍼 및 배출 행동 보장 (5초 보류)...")
-                time.sleep(5.0)
-                
-                # 대기 상태 복구 및 쓰레기 배치 가이드 화면 재출력
-                lcd.clear()
-                lcd.display_text("PLACE WASTE FIRST", lcd.LCD_LINE_1)
-                lcd.display_text("APPROACH TO TRIG", lcd.LCD_LINE_2)
-                print(" -> 시스템 상태 복원 완료. [현재 상태: IDLE]\n")
-                current_state = STATE_IDLE
+                # [개선 핵심] 전시 중에도 메인 쓰레드가 차단되지 않으므로 온습도 센서 수집을 매끄럽게 처리합니다.
+                if current_time - last_dht_time >= 3.0:
+                    temp, hum, status = read_dht11_detailed()
+                    now_str = datetime.now().strftime('%H:%M:%S')
+                    if status == "SUCCESS":
+                        print(f"[{now_str}] 내부 온도: {temp}°C | 내부 습도: {hum}%")
+                    else:
+                        print(f"[{now_str}] 온습도 감지 대기 중 (원인: {status})")
+                    last_dht_time = current_time
+
+                # 비차단 타임 계산: 5초가 경과하면 안전하게 IDLE로 복구
+                if current_time - state_entry_time >= 5.0:
+                    lcd.clear()
+                    lcd.display_text("PLACE WASTE FIRST", lcd.LCD_LINE_1)
+                    lcd.display_text("APPROACH TO TRIG", lcd.LCD_LINE_2)
+                    print(" -> 시스템 상태 복원 완료. [현재 상태: IDLE]\n")
+                    current_state = STATE_IDLE
 
             # ==========================================
-            # [상태 4] STATE_RESULT_ERROR: 탐지 실패 사유별 세부 제어 흐름
+            # [상태 4] STATE_RESULT_ERROR: 탐지 실패 사유별 세부 제어 흐름 (비차단형 구현)
             # ==========================================
             elif current_state == STATE_RESULT_ERROR:
-                lcd.clear()
-                
-                # 에러 원인에 따른 차별화 메시지 출력 구현
-                if error_reason == "NO_OBJECT":
-                    lcd.display_text("DETECTION ERROR ", lcd.LCD_LINE_1)
-                    lcd.display_text("TRY AGAIN (EMPTY)", lcd.LCD_LINE_2)
-                    print("시스템 피드백: 촬영본에 물체가 정상적으로 식별되지 않습니다. 쓰레기가 올바르게 배치되었는지 점검하세요.")
-                elif error_reason == "LOW_CONFIDENCE":
-                    lcd.display_text("DETECTION ERROR ", lcd.LCD_LINE_1)
-                    lcd.display_text("UNRECOGNIZED WT ", lcd.LCD_LINE_2)
-                    print("시스템 피드백: 쓰레기 분리 배출 종류 식별의 불확실성이 큽니다. 다시 시도하세요.")
-                elif error_reason == "SYSTEM_FAULT":
-                    lcd.display_text("  SYSTEM ERROR  ", lcd.LCD_LINE_1)
-                    lcd.display_text("CHECK CAMERA/HW ", lcd.LCD_LINE_2)
-                    print("시스템 경고: 하드웨어 모듈 및 I/O 핀 결선 장애 의심. 연결을 진단하세요.")
-                
-                print(" -> 예외 출력 고정 대기 및 예외 복구 버퍼링 (5초 대기)...")
-                time.sleep(5.0)
-                
-                # 대기 상태 복구 및 가이드 화면 복구
-                lcd.clear()
-                lcd.display_text("PLACE WASTE FIRST", lcd.LCD_LINE_1)
-                lcd.display_text("APPROACH TO TRIG", lcd.LCD_LINE_2)
-                print(" -> 예외 복구 및 센서 대기 모드 진입. [현재 상태: IDLE]\n")
-                current_state = STATE_IDLE
+                if not result_displayed:
+                    lcd.clear()
+                    # 에러 원인에 따른 차별화 메시지 출력 구현
+                    if error_reason == "NO_OBJECT":
+                        lcd.display_text("DETECTION ERROR ", lcd.LCD_LINE_1)
+                        lcd.display_text("TRY AGAIN (EMPTY)", lcd.LCD_LINE_2)
+                        print("시스템 피드백: 촬영본에 물체가 정상적으로 식별되지 않습니다. 쓰레기가 올바르게 배치되었는지 점검하세요.")
+                    elif error_reason == "LOW_CONFIDENCE":
+                        lcd.display_text("DETECTION ERROR ", lcd.LCD_LINE_1)
+                        lcd.display_text("UNRECOGNIZED WT ", lcd.LCD_LINE_2)
+                        print("시스템 피드백: 쓰레기 분리 배출 종류 식별의 불확실성이 큽니다. 다시 시도하세요.")
+                    elif error_reason == "SYSTEM_FAULT":
+                        lcd.display_text("  SYSTEM ERROR  ", lcd.LCD_LINE_1)
+                        lcd.display_text("CHECK CAMERA/HW ", lcd.LCD_LINE_2)
+                        print("시스템 경고: 하드웨어 모듈 및 I/O 핀 결선 장애 의심. 연결을 진단하세요.")
+                    
+                    print(" -> 에러 리포트 가이드 제공 시작 (비차단식 5초 버퍼 가동)")
+                    result_displayed = True
+
+                # 전시 중에도 온습도 정밀 지속 로깅
+                if current_time - last_dht_time >= 3.0:
+                    temp, hum, status = read_dht11_detailed()
+                    now_str = datetime.now().strftime('%H:%M:%S')
+                    if status == "SUCCESS":
+                        print(f"[{now_str}] 내부 온도: {temp}°C | 내부 습도: {hum}%")
+                    else:
+                        print(f"[{now_str}] 온습도 감지 대기 중 (원인: {status})")
+                    last_dht_time = current_time
+
+                # 5초 경과 시 IDLE로 복구
+                if current_time - state_entry_time >= 5.0:
+                    lcd.clear()
+                    lcd.display_text("PLACE WASTE FIRST", lcd.LCD_LINE_1)
+                    lcd.display_text("APPROACH TO TRIG", lcd.LCD_LINE_2)
+                    print(" -> 예외 복구 및 센서 대기 모드 진입. [현재 상태: IDLE]\n")
+                    current_state = STATE_IDLE
 
             # 루프 사이클 CPU 점유율 과다 차단용 마이크로 지연
             time.sleep(0.05)

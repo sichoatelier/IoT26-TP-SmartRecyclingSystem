@@ -5,8 +5,7 @@ from datetime import datetime
 import gpiod
 from gpiod.line import Direction, Value  # gpiod v2.x의 표준 방향 및 값 정의 임포트
 from smbus2 import SMBus
-from picamera2 import Picamera2
-from libcamera import Transform  # 하드웨어 GPU 180도 회전 필수 모듈
+import cv2  # 컨테이너 환경에서 안정적이고 가벼운 OpenCV 임포트
 from ultralytics import YOLO  # YOLOv8 추론 및 NCNN 가속화를 위한 라이브러리
 
 # ==========================================
@@ -108,7 +107,7 @@ class I2CLCD:
 # 4. 온습도 센서 (DHT11) 나노초 정밀 수집 함수
 # ==========================================
 def read_dht11_detailed():
-    """도커 컨테이너 지연을 극복하기 위한 나노초 단위 절대 시간 변동 측정 수행"""
+    """도커 컨테이너 지연을 극복하기 위한 나노초 단위 절대 시간 변동 측정 수행."""
     timestamps = []
     values = []
     
@@ -193,11 +192,11 @@ def read_dht11_detailed():
         return None, None, "체크섬 불일치 (데이터 깨짐)"
 
 # ==========================================
-# 5. 검증된 초음파 센서 (HC-SR04) 거리 측정 함수
+# 5. 초음파 센서 (HC-SR04) 거리 측정 함수
 # ==========================================
 def get_ultrasonic_distance():
     """
-    gpiod v2.x request_lines 방식을 기반으로 초음파 센서로부터 거리를 계산하여 cm 단위로 반환
+    gpiod v2.x request_lines 방식을 기반으로 초음파 센서로부터 거리를 계산하여 cm 단위로 반환.
     """
     try:
         with gpiod.request_lines(
@@ -250,7 +249,7 @@ def get_ultrasonic_distance():
 # ==========================================
 def initialize_ai_model():
     """
-    NCNN 기반 가속 모델을 우선적으로 로드하고, 없을 경우 PT 모델을 컴파일하여 내보냅니다.
+    NCNN 기반 가속 모델을 우선적으로 로드하고, 없을 경우 PT 모델을 컴파일하여 내보냄.
     """
     print("\n[AI 모델 초기화] 가중치 로드 시도 중...")
     if os.path.exists(NCNN_MODEL_DIR):
@@ -276,7 +275,7 @@ def initialize_ai_model():
 # ==========================================
 def main():
     print("=" * 60)
-    print("AIoT 스마트 분리수거 시스템 - 3단계 상태 기계 & YOLO 통합")
+    print("AIoT 스마트 분리수거 시스템 - OpenCV V4L2 가속 포팅 버전")
     print("=" * 60)
     
     # 7-1. LCD 하드웨어 초기화
@@ -291,15 +290,18 @@ def main():
         lcd.display_text("  AI MODEL ERR  ", lcd.LCD_LINE_2)
         sys.exit(1)
 
-    # 7-3. Picamera2 초기화 및 180도 회전 하드웨어 가속 적용
-    print("카메라 장치 초기화 중...")
+    # 7-3. OpenCV 기반 V4L2 비디오 스트림 초기화 (도커 친화 백엔드)
+    print("카메라 장치(OpenCV V4L2) 초기화 중...")
     try:
-        pic = Picamera2()
-        config = pic.create_preview_configuration(main={"size": (1280, 720)})
-        config["transform"] = Transform(180)  # 뒤집혀 장착된 물리 카메라 180도 회전 보정
-        pic.configure(config)
-        pic.start()
-        print("카메라 프리뷰 구동 완료.")
+        # V4L2 드라이버를 통해 /dev/video0에 직접 바인딩
+        cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            raise IOError("카메라 노드를 열 수 없습니다. 연결 상태를 확인하세요.")
+            
+        # YOLO 이미지 분석 해상도로 최적화 설정
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        print("OpenCV 카메라 구동 완료.")
     except Exception as e:
         print(f"카메라 제어 실패: {e}")
         lcd.display_text(" CAMERA ERROR!  ", lcd.LCD_LINE_2)
@@ -339,14 +341,14 @@ def main():
                         print(f"[{now_str}] 온습도 감지 대기 중 (원인: {status})")
                     last_dht_time = current_time
                 
-                # 초음파를 통해 쓰레기가 아닌 '사용자의 접근(손/몸)' 감지
+                # 초음파를 통해 사용자의 접근(손/몸) 감지
                 dist = get_ultrasonic_distance()
                 if 0.0 < dist <= 7.0:
                     print(f"\n[사용자 접근 감지] {dist}cm에 사용자 감지. 즉시 카메라 캡처를 실행합니다.")
                     current_state = STATE_SCANNING
 
             # ==========================================
-            # [상태 2] STATE_SCANNING: 사용자 트리거로 즉각 촬영 및 AI 분석
+            # [상태 2] STATE_SCANNING: 사용자 트리거로 즉각 촬영 및 AI 분석 (OpenCV 버전)
             # ==========================================
             elif current_state == STATE_SCANNING:
                 lcd.clear()
@@ -355,8 +357,19 @@ def main():
                 
                 print(" -> 사용자 접근 조건 만족: 카메라 촬영 즉시 트리거 실행...")
                 try:
-                    # 180도 회전 처리가 끝난 프레임을 캡처 파일로 즉시 저장
-                    pic.capture_file(TEMP_IMAGE_PATH)
+                    # OpenCV 드라이버의 이전 버퍼 프레임들을 밀어내어 가장 최신 프레임을 수집합니다.
+                    for _ in range(5):
+                        cap.read()
+                        
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        raise IOError("프레임 수집 실패")
+                        
+                    # [특수 처리 이식] 기존 Transform(180)의 역할을 OpenCV 하드웨어 가속 회전 연산으로 완벽하게 대체
+                    frame = cv2.rotate(frame, cv2.ROTATE_180)
+                    
+                    # 캡처 파일을 YOLO 분석용 지정 경로에 동적 저장
+                    cv2.imwrite(TEMP_IMAGE_PATH, frame)
                     print(f" -> [캡처 성공] 임시 이미지 보관 완료: {TEMP_IMAGE_PATH}")
                     
                     # 캡처 직후 분석 안내 메시지 전환
@@ -437,7 +450,7 @@ def main():
                     elif "glass" in success_item_name:
                         lcd.display_text("GLASS BOTTLE", lcd.LCD_LINE_1)
                         lcd.display_text("RINSE WITH WATER", lcd.LCD_LINE_2)
-                        print("가이드: [유리병] 내용물을 가볍게 헹군 뒤 깨지지 않도록 수거해야합니다.")
+                        print("가이드: [유리병] 내용물을 가볍게 헹군 뒤 깨지지 않도록 배출해주세요.")
                     else:
                         lcd.display_text("GENERAL TRASH", lcd.LCD_LINE_1)
                         lcd.display_text("PUT IN THE BIN", lcd.LCD_LINE_2)
@@ -446,7 +459,7 @@ def main():
                     print(" -> 시스템 배출 가이드 제공 시작 (비차단식 5초 버퍼 가동)")
                     result_displayed = True
 
-                # [개선 핵심] 전시 중에도 메인 쓰레드가 차단되지 않으므로 온습도 센서 수집을 매끄럽게 처리합니다.
+                # 전시 중에도 온습도 센서 지속 로깅
                 if current_time - last_dht_time >= 3.0:
                     temp, hum, status = read_dht11_detailed()
                     now_str = datetime.now().strftime('%H:%M:%S')
@@ -512,7 +525,7 @@ def main():
         print("\n사용자에 의해 시스템이 안전 종료됩니다. 모든 자원을 정상 해제합니다.")
     finally:
         try:
-            pic.stop()
+            cap.release()  # OpenCV 비디오 자원 반환
         except:
             pass
         lcd.clear()

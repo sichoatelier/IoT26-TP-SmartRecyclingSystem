@@ -33,12 +33,12 @@ LCD_ADDRESS = 0x27  # i2cdetect 결과에 따라 0x3F 등으로 변경 가능
 I2C_BUS = 1
 
 # 파일 및 AI 모델 저장 경로 설정
-SAVE_DIR = "/home/iot-team5/Desktop"
+SAVE_DIR = "/opt/Desktop"
 if not os.path.exists(SAVE_DIR):
     SAVE_DIR = os.getcwd()  # 경로가 없으면 현재 작업 폴더에 저장
 
-PT_MODEL_PATH = "yolo26n.pt"            # 베이스 PyTorch 가중치 모델
-NCNN_MODEL_DIR = "yolo26n_ncnn_model"  # 초고속 NCNN 가속화 컴파일 모델 디렉토리
+PT_MODEL_PATH = "best.pt"            # 베이스 PyTorch 가중치 모델
+NCNN_MODEL_DIR = "best_ncnn_model"  # 초고속 NCNN 가속화 컴파일 모델 디렉토리
 TEMP_IMAGE_PATH = os.path.join(SAVE_DIR, "captured_waste.jpg")
 
 CONFIDENCE_THRESHOLD = 0.5  # 인공지능 분석 신뢰도 커트라인 (50%)

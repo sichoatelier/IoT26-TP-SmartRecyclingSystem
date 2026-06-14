@@ -305,85 +305,122 @@ def get_ultrasonic_distance():
 
 
 # ==========================================
-# 6. OpenCV V4L2 동적 프레임 수집기 (상세 단계별 디버깅 강화)
+# 6. OpenCV V4L2 동적 프레임 수집기 (640x640 YOLO 최적화 종횡비 지원)
 # ==========================================
 def capture_single_frame(output_path):
     """
-    OpenCV V4L2 카메라 하드웨어의 상태 변화를 단계별로 로깅하며 캡처를 수행합니다.
-    어떤 라이프사이클(인덱스 바인딩, 포맷 파라미터 적용, 예열 루프, 이미지 후처리, I/O 저장)에서 
-    장애가 발생하는지 파악할 수 있도록 진단 상세도가 보강되었습니다.
+    라즈베리파이 5 및 컨테이너 V4L2 스트림 환경에서 동작하도록 성능과 호환성을 최적화한 카메라 캡처 함수입니다.
+    YOLO의 이상적인 수용야 크기인 640x640 정방 이미지를 획득하기 위해 하드웨어 640x480 촬영 후,
+    정교한 제로 패딩(Letterboxing) 연산을 수행하여 모델의 형상 보존 정확도를 극대화합니다.
     """
     cap = None
-    print("[CAM_DEBUG] [1단계] 카메라 리소스 접근 및 드라이버 레이어 바인딩 시도 중...")
-    try:
-        # V4L2 백엔드를 통해 카메라 디바이스 접근 시도
-        cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            print("[CAM_DEBUG] [1-1단계] CAP_V4L2 초기 바인딩 실패. 기본 백엔드로 대체 오픈 시도...")
-            cap = cv2.VideoCapture(0)
+    success = False
+    
+    # 디바이스 주소 및 백엔드 조합 리스트 정의
+    configs = [
+        {"idx": 0, "api": cv2.CAP_V4L2, "desc": "V4L2 전용 백엔드 (디바이스 0)"},
+        {"idx": 0, "api": cv2.CAP_ANY,  "desc": "기본 하드웨어 탐색 백엔 (디바이스 0)"},
+        {"idx": 1, "api": cv2.CAP_V4L2, "desc": "V4L2 전용 백엔드 (디바이스 1)"}
+    ]
+    
+    for cfg in configs:
+        print(f"[CAM_DEBUG] [1단계] {cfg['desc']} 접근 구성 테스트 중...")
+        try:
+            cap = cv2.VideoCapture(cfg["idx"], cfg["api"])
             if not cap.isOpened():
-                print("[CAM_DEBUG] [ERROR] 카메라 디바이스(/dev/video0)를 열 수 없습니다. 케이블 결합 상태나 권한을 확인하세요.")
-                return False
-        
-        print("[CAM_DEBUG] [2단계] 하드웨어 드라이버 바인딩 성공. 스트림 포맷 구성(1280x720) 시도...")
-        
-        # 해상도 매개변수 적용 및 반환 검증
-        set_w = cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        set_h = cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        print(f"[CAM_DEBUG]  -> 파라미터 설정 결과: 가로={set_w}({actual_w}), 세로={set_h}({actual_h})")
-        
-        print("[CAM_DEBUG] [3단계] 자동 화이트밸런스 및 광량 보정을 위한 백엔드 큐(예열) 플러시 시작...")
-        # 백엔드 버퍼에 정체된 오래된 오버플로우 프레임을 제거하기 위해 5회 더미 읽기 진행
-        for i in range(5):
-            flush_start = time.time()
-            ret_dummy, _ = cap.read()
-            flush_duration = (time.time() - flush_start) * 1000.0
-            if not ret_dummy:
-                print(f"[CAM_DEBUG] [WARN] 예열 {i+1}회차 더미 읽기 실패 (시간: {flush_duration:.1f}ms). 스트림이 비정상일 수 있습니다.")
-            else:
-                print(f"[CAM_DEBUG]  -> 예열 {i+1}회차 읽기 통과 ({flush_duration:.1f}ms 소요)")
-            time.sleep(0.03)
+                print(f"[CAM_DEBUG]   -> 포트 바인딩 거절됨. 다음 조합을 탐색합니다.")
+                if cap is not None:
+                    cap.release()
+                continue
+                
+            # 드라이버 수준의 프레임 캐시 최소화 설정 (최신 프레임 획득 보장)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             
-        print("[CAM_DEBUG] [4단계] AI 분석용 메인 정지 이미지 프레임 캡처 시도...")
-        capture_start = time.time()
-        ret, frame = cap.read()
-        capture_duration = (time.time() - capture_start) * 1000.0
-        
-        if not ret or frame is None:
-            print(f"[CAM_DEBUG] [ERROR] 메인 프레임 디코드 실패 (성공플래그={ret}, 획득여부={frame is not None}, 소요시간={capture_duration:.1f}ms)")
-            return False
+            # YOLO v8/v11 최적화 타겟 해상도 설정
+            # 드라이버 레벨에서 640x480(혹은 하드웨어가 640x640 정사각 출력을 지원하면 바로 처리) 세팅 시도
+            set_w = cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            set_h = cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            print(f"[CAM_DEBUG] [2단계] 해상도 세팅: 640x480 요청 -> 실제 설정 가로={actual_w}, 세로={actual_h}")
             
-        print(f"[CAM_DEBUG]  -> 프레임 캡처 성공! 데이터 차원: {frame.shape} (소요시간: {capture_duration:.1f}ms)")
-        
-        print("[CAM_DEBUG] [5단계] 프레임 기하 변환 처리 시작 (OpenCV 180도 고속 회전)...")
-        try:
+            # 카메라 센서 픽셀 활성화 및 수렴 유예 시간 제공
+            print("[CAM_DEBUG] [3단계] 카메라 하드웨어 및 드라이버 웜업 개시 (0.5초 유예 지연)...")
+            time.sleep(0.5) 
+            
+            # 백엔드 잔류 데이터 수거 루프
+            print("[CAM_DEBUG] [4단계] 하드웨어 레지스터 큐 플러시 시작...")
+            for i in range(8):
+                flush_start = time.time()
+                ret_dummy, dummy_frame = cap.read()
+                flush_duration = (time.time() - flush_start) * 1000.0
+                
+                if not ret_dummy or dummy_frame is None:
+                    print(f"[CAM_DEBUG]   -> 버퍼 웜업 {i+1}회차 무반응 ({flush_duration:.1f}ms). 복구 지연 인가 중...")
+                    time.sleep(0.08)
+                else:
+                    print(f"[CAM_DEBUG]   -> 버퍼 웜업 {i+1}회차 통과! 데이터 크기={dummy_frame.shape} ({flush_duration:.1f}ms)")
+            
+            print("[CAM_DEBUG] [5단계] AI 추론용 메인 정지 프레임 스트림 캡처...")
+            capture_start = time.time()
+            ret, frame = cap.read()
+            capture_duration = (time.time() - capture_start) * 1000.0
+            
+            if not ret or frame is None:
+                print(f"[CAM_DEBUG] [WARN] 메인 프레임 캡처 실패 ({capture_duration:.1f}ms). 다음 채널로 우회합니다.")
+                cap.release()
+                continue
+                
+            print(f"[CAM_DEBUG]   -> 프레임 취득 완료! 해상도={frame.shape} (디코드 시간: {capture_duration:.1f}ms)")
+            
+            # 이미지 회전 연산
+            print("[CAM_DEBUG] [6단계] 프레임 전처리 연산 실행 (180도 고속 반전)...")
             frame = cv2.rotate(frame, cv2.ROTATE_180)
-            print("[CAM_DEBUG]  -> 이미지 180도 회전 완료.")
-        except Exception as rot_err:
-            print(f"[CAM_DEBUG] [ERROR] 이미지 회전 처리 중 예외 발생: {rot_err}")
-            return False
-        
-        print(f"[CAM_DEBUG] [6단계] 로컬 비휘발성 저장 매체에 보관 시도 (대상 경로: {output_path})...")
-        try:
+            
+            # ★ 핵심 최적화: 640x480 규격을 YOLO 전용 640x640 포맷으로 리사이즈 및 패딩 (Letterboxing)
+            # 이미지 좌우 비율 왜곡 없이 빈 공간(상하)을 검정색 패딩으로 메워 YOLO 추론의 신뢰도를 급상승시킵니다.
+            h, w = frame.shape[:2]
+            if h != 640 or w != 640:
+                print(f"[CAM_DEBUG]   -> YOLO 표준 규격화 변환: {w}x{h}에서 640x640 정사각 레터박스 패딩 적용...")
+                # 가로(width)를 640에 맞추어 비율 유지 축소/확대
+                scale = 640.0 / max(h, w)
+                resized_frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
+                
+                # 640x640 검정색 빈 캔버스 생성
+                final_square = cv2.copyMakeBorder(
+                    resized_frame,
+                    top=(640 - resized_frame.shape[0]) // 2,
+                    bottom=640 - resized_frame.shape[0] - ((640 - resized_frame.shape[0]) // 2),
+                    left=(640 - resized_frame.shape[1]) // 2,
+                    right=640 - resized_frame.shape[1] - ((640 - resized_frame.shape[1]) // 2),
+                    borderType=cv2.BORDER_CONSTANT,
+                    value=[0, 0, 0]  # 검정색 패딩 처리
+                )
+                frame = final_square
+                print(f"[CAM_DEBUG]   -> 최종 연산 프레임 차원: {frame.shape}")
+            
+            # 이미지 파일 물리적 디스크 영구 저장
+            print(f"[CAM_DEBUG] [7단계] '{output_path}' 디스크 파일 쓰기 트랜잭션 수행 중...")
             write_ret = cv2.imwrite(output_path, frame)
             if not write_ret:
-                print(f"[CAM_DEBUG] [ERROR] 파일 쓰기 드라이버 반환 에러. '{output_path}' 경로의 쓰기 권한 및 잔여 공간을 확인하세요.")
-                return False
-            print(f"[CAM_DEBUG] [SUCCESS] 파일 쓰기 완료! 저장 절대경로: {os.path.abspath(output_path)}")
-            return True
-        except Exception as io_err:
-            print(f"[CAM_DEBUG] [ERROR] 파일 I/O 시스템 예외 발생: {io_err}")
-            return False
+                print("[CAM_DEBUG] [ERROR] 디스크 I/O 드라이버 쓰기 반환값 실패.")
+                cap.release()
+                continue
+                
+            print(f"[CAM_DEBUG] [SUCCESS] YOLO 최적화 완료! 저장 절대경로: {os.path.abspath(output_path)}")
+            success = True
+            break  # 프레임 확보 및 저장 성공 시 드라이버 시도 루프 중단
             
-    except Exception as e:
-        print(f"[CAM_DEBUG] [FATAL_ERROR] 카메라 캡처 파이프라인 내부 파괴적 예외 발생: {e}")
-        return False
-    finally:
-        if cap is not None:
-            cap.release()
-            print("[CAM_DEBUG] [7단계] 비디오 스트림 연결 해제 및 카메라 리소스 반환 처리가 완료되었습니다.")
+        except Exception as e:
+            print(f"[CAM_DEBUG] [EXCEPT] 채널 구동 중 에러 발생: {e}")
+            if cap is not None:
+                cap.release()
+                
+    if cap is not None and cap.isOpened():
+        cap.release()
+        print("[CAM_DEBUG] [8단계] 비디오 인스턴스 해제 및 운영체제 리소스 반환 완료.")
+        
+    return success
 
 
 # ==========================================

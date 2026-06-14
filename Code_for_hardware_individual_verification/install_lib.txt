@@ -1,0 +1,7 @@
+# 초음파 센서와 온습도 센서용
+pip install gpiod
+
+# LCD 디스플레이용
+sudo raspi-config   # 1. 라즈베리파이 I2C 기능 켜기 (설정창 진입 후 Interface Options -> I2C -> Enable 순으로 켬)
+pip install smbus2  # 2. I2C 버스 제어용 필수 라이브러리 설치
+sudo i2cdetect -y 1 # 3. 내 LCD의 주소 확인 (일반적으로 27 또는 3f가 출력됨)

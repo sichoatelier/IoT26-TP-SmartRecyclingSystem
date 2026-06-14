@@ -3,6 +3,7 @@ import sys
 import time
 from datetime import datetime
 import gpiod
+from gpiod.line import Direction, Value  # gpiod v2.x의 표준 방향 및 값 정의 임포트
 from smbus2 import SMBus
 from picamera2 import Picamera2
 from libcamera import Transform  # 하드웨어 GPU 180도 회전 필수 모듈
@@ -37,7 +38,7 @@ class I2CLCD:
         try:
             self.bus = SMBus(bus_num)
         except Exception as e:
-            print(f"[경고] I2C 버스를 열 수 없음. LCD가 작동하지 않음. ({e})")
+            print(f"[경고] I2C 버스를 열 수 없음. LCD가 작동하지 않음 ({e})")
             self.bus = None
             return
             
@@ -92,7 +93,7 @@ class I2CLCD:
 # 3. 온습도 센서 (DHT11) 나노초 정밀 수집 함수
 # ==========================================
 def read_dht11_detailed():
-    """도커 컨테이너 지연을 극복하기 위해 나노초 단위 절대 시간 변동 측정을 수행합니다."""
+    """도커 컨테이너 지연을 극복하기 위해 나노초 단위 절대 시간 변동 측정을 수행"""
     timestamps = []
     values = []
     
@@ -180,43 +181,54 @@ def read_dht11_detailed():
 # 4. 초음파 센서 (HC-SR04) 거리 측정 함수
 # ==========================================
 def get_ultrasonic_distance():
-    """초음파 센서로부터 거리를 계산하여 cm 단위로 반환합니다."""
+    """
+    gpiod v2.x request_lines 방식을 기반으로 초음파 센서로부터 거리를 계산하여 cm 단위로 반환합니다.
+    기존의 개별 chip 접근 방식 대신 한 번의 세션 내에서 입력/출력 라인을 할당하여 오작동을 차단합니다.
+    """
     try:
-        with gpiod.Chip(CHIP_PATH) as chip:
-            trig_line = chip.get_line(TRIG_PIN)
-            echo_line = chip.get_line(ECHO_PIN)
+        with gpiod.request_lines(
+            CHIP_PATH,
+            consumer="Ultrasonic",
+            config={
+                TRIG_PIN: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE),
+                ECHO_PIN: gpiod.LineSettings(direction=Direction.INPUT)
+            }
+        ) as lines:
             
-            trig_line.request(consumer="Ultrasonic", type=gpiod.LINE_REQ_DIR_OUT)
-            echo_line.request(consumer="Ultrasonic", type=gpiod.LINE_REQ_DIR_IN)
+            # 1. Trigger 핀을 Low(0)로 잠시 안정화
+            lines.set_value(TRIG_PIN, Value.INACTIVE)
+            time.sleep(0.05)  # 50ms 대기 (통합 대기 지연 최적화)
             
-            trig_line.set_value(0)
-            time.sleep(0.02)  # 센서 안정화 시간
-            
-            # Trigger 핀에 10us High 펄스 인가
-            trig_line.set_value(1)
+            # 2. Trigger 핀에 10us의 High(1) 펄스 인가
+            lines.set_value(TRIG_PIN, Value.ACTIVE)
             time.sleep(0.00001)
-            trig_line.set_value(0)
+            lines.set_value(TRIG_PIN, Value.INACTIVE)
             
+            # 3. Echo 핀이 High가 되는 시간 측정
             start_time = time.time()
-            timeout = start_time + 1.0
+            timeout = start_time + 1.0  # 1초 타임아웃
             
-            while echo_line.get_value() == 0:
+            while lines.get_value(ECHO_PIN) == Value.INACTIVE:
                 start_time = time.time()
                 if start_time > timeout:
                     return -1.0
                     
+            # 4. Echo 핀이 Low가 되는 시간 측정
             stop_time = time.time()
             timeout = stop_time + 1.0
-            while echo_line.get_value() == 1:
+            while lines.get_value(ECHO_PIN) == Value.ACTIVE:
                 stop_time = time.time()
                 if stop_time > timeout:
                     return -1.0
                     
+            # 5. 왕복 시간 계산 및 거리 환산 (단위: cm)
             duration = stop_time - start_time
             distance = duration * 17150
+            
             return round(distance, 1)
+            
     except Exception as e:
-        print(f"[경고] 초음파 센서 칩 접근 에러: {e}")
+        print(f"[경고] 초음파 센서 제어 에러: {e}")
         return -1.0
 
 # ==========================================
@@ -248,7 +260,7 @@ def main():
         sys.exit(1)
 
     lcd.display_text("   [ READY ]    ", lcd.LCD_LINE_2)
-    print("통합 관제 감지 루프 시작...")
+    print("통합 관제 감지 루프 작동 시작...")
     
     capture_count = 0
     last_dht_time = 0  # 온습도 출력 제한용 타이머 (3초 주기)
@@ -262,12 +274,12 @@ def main():
                 temp, hum, status = read_dht11_detailed()
                 now_str = datetime.now().strftime('%H:%M:%S')
                 if status == "SUCCESS":
-                    print(f"[{now_str}] 내부 온도: {temp}°C | 💧 내부 습도: {hum}% [정상 수집]")
+                    print(f"[{now_str}] 내부 온도: {temp}°C | 내부 습도: {hum}% [정상 수집]")
                 else:
                     print(f"[{now_str}] 온습도 수집 불가 원인: {status}")
                 last_dht_time = current_time
             
-            # 5-2. 실시간 초음파 거리 센싱
+            # 5-2. 실시간 초음파 거리 센싱 (검증된 v2.x 기반 함수 호출)
             dist = get_ultrasonic_distance()
             
             # 7cm 이하 감지 시 캡처 흐름 돌입

@@ -305,48 +305,85 @@ def get_ultrasonic_distance():
 
 
 # ==========================================
-# 6. OpenCV V4L2 동적 프레임 수집기 (도커 컨테이너 안정성 확보 핵심)
+# 6. OpenCV V4L2 동적 프레임 수집기 (상세 단계별 디버깅 강화)
 # ==========================================
 def capture_single_frame(output_path):
     """
-    OpenCV V4L2 카메라를 캡처가 필요할 때만 열어 예열 후 프레임을 저장하고 즉시 메모리를 해제합니다.
-    대기 시간 도안의 V4L2 버퍼 오버플로우 및 리소스 이중 락으로 인한 캡처 실패를 원천 해결합니다.
+    OpenCV V4L2 카메라 하드웨어의 상태 변화를 단계별로 로깅하며 캡처를 수행합니다.
+    어떤 라이프사이클(인덱스 바인딩, 포맷 파라미터 적용, 예열 루프, 이미지 후처리, I/O 저장)에서 
+    장애가 발생하는지 파악할 수 있도록 진단 상세도가 보강되었습니다.
     """
     cap = None
+    print("[CAM_DEBUG] [1단계] 카메라 리소스 접근 및 드라이버 레이어 바인딩 시도 중...")
     try:
-        # V4L2 호환 레이어 명시적 지정
+        # V4L2 백엔드를 통해 카메라 디바이스 접근 시도
         cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
         if not cap.isOpened():
-            # 예외 예비책으로 기본 백엔드 시도
+            print("[CAM_DEBUG] [1-1단계] CAP_V4L2 초기 바인딩 실패. 기본 백엔드로 대체 오픈 시도...")
             cap = cv2.VideoCapture(0)
             if not cap.isOpened():
+                print("[CAM_DEBUG] [ERROR] 카메라 디바이스(/dev/video0)를 열 수 없습니다. 케이블 결합 상태나 권한을 확인하세요.")
                 return False
-                
-        # 해상도 설정
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         
-        # 센서 광량 예열 (안정적인 밝기 프레임을 획득하기 위함)
-        for _ in range(5):
-            cap.read()
+        print("[CAM_DEBUG] [2단계] 하드웨어 드라이버 바인딩 성공. 스트림 포맷 구성(1280x720) 시도...")
+        
+        # 해상도 매개변수 적용 및 반환 검증
+        set_w = cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        set_h = cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        print(f"[CAM_DEBUG]  -> 파라미터 설정 결과: 가로={set_w}({actual_w}), 세로={set_h}({actual_h})")
+        
+        print("[CAM_DEBUG] [3단계] 자동 화이트밸런스 및 광량 보정을 위한 백엔드 큐(예열) 플러시 시작...")
+        # 백엔드 버퍼에 정체된 오래된 오버플로우 프레임을 제거하기 위해 5회 더미 읽기 진행
+        for i in range(5):
+            flush_start = time.time()
+            ret_dummy, _ = cap.read()
+            flush_duration = (time.time() - flush_start) * 1000.0
+            if not ret_dummy:
+                print(f"[CAM_DEBUG] [WARN] 예열 {i+1}회차 더미 읽기 실패 (시간: {flush_duration:.1f}ms). 스트림이 비정상일 수 있습니다.")
+            else:
+                print(f"[CAM_DEBUG]  -> 예열 {i+1}회차 읽기 통과 ({flush_duration:.1f}ms 소요)")
             time.sleep(0.03)
             
+        print("[CAM_DEBUG] [4단계] AI 분석용 메인 정지 이미지 프레임 캡처 시도...")
+        capture_start = time.time()
         ret, frame = cap.read()
+        capture_duration = (time.time() - capture_start) * 1000.0
+        
         if not ret or frame is None:
+            print(f"[CAM_DEBUG] [ERROR] 메인 프레임 디코드 실패 (성공플래그={ret}, 획득여부={frame is not None}, 소요시간={capture_duration:.1f}ms)")
             return False
             
-        # GPU 가속 Transform 대신 OpenCV 180도 회전 연산
-        frame = cv2.rotate(frame, cv2.ROTATE_180)
+        print(f"[CAM_DEBUG]  -> 프레임 캡처 성공! 데이터 차원: {frame.shape} (소요시간: {capture_duration:.1f}ms)")
         
-        # 지정 경로 임시 파일 보관
-        cv2.imwrite(output_path, frame)
-        return True
+        print("[CAM_DEBUG] [5단계] 프레임 기하 변환 처리 시작 (OpenCV 180도 고속 회전)...")
+        try:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+            print("[CAM_DEBUG]  -> 이미지 180도 회전 완료.")
+        except Exception as rot_err:
+            print(f"[CAM_DEBUG] [ERROR] 이미지 회전 처리 중 예외 발생: {rot_err}")
+            return False
+        
+        print(f"[CAM_DEBUG] [6단계] 로컬 비휘발성 저장 매체에 보관 시도 (대상 경로: {output_path})...")
+        try:
+            write_ret = cv2.imwrite(output_path, frame)
+            if not write_ret:
+                print(f"[CAM_DEBUG] [ERROR] 파일 쓰기 드라이버 반환 에러. '{output_path}' 경로의 쓰기 권한 및 잔여 공간을 확인하세요.")
+                return False
+            print(f"[CAM_DEBUG] [SUCCESS] 파일 쓰기 완료! 저장 절대경로: {os.path.abspath(output_path)}")
+            return True
+        except Exception as io_err:
+            print(f"[CAM_DEBUG] [ERROR] 파일 I/O 시스템 예외 발생: {io_err}")
+            return False
+            
     except Exception as e:
-        print(f"카메라 하드웨어 구동 실패: {e}")
+        print(f"[CAM_DEBUG] [FATAL_ERROR] 카메라 캡처 파이프라인 내부 파괴적 예외 발생: {e}")
         return False
     finally:
         if cap is not None:
             cap.release()
+            print("[CAM_DEBUG] [7단계] 비디오 스트림 연결 해제 및 카메라 리소스 반환 처리가 완료되었습니다.")
 
 
 # ==========================================
@@ -453,7 +490,7 @@ def main():
                 # OpenCV 동적 프레임 캡처 함수 호출 (도커 에러 해결법)
                 ret = capture_single_frame(TEMP_IMAGE_PATH)
                 if not ret:
-                    print(" 카메라 캡처 중 하드웨어 장애 발생: 프레임 수집 실패")
+                    print(" [SYSTEM_ALERT] 카메라 하드웨어 장애 발생으로 이미지 프레임을 가져오지 못했습니다.")
                     current_state = STATE_RESULT_ERROR
                     error_reason = "SYSTEM_FAULT"
                     state_entry_time = time.time()
@@ -587,7 +624,7 @@ def main():
                     elif error_reason == "SYSTEM_FAULT":
                         lcd.set_message("  SYSTEM ERROR  ", lcd.LCD_LINE_1)
                         lcd.set_message("CHECK CAMERA/HW", lcd.LCD_LINE_2)
-                        print("시스템 경고: 하드웨어 모듈 및 I/O 핀 결선 장애 의심. 연결을 진단하세요.")
+                        print("시스템 경고: 하드웨어 모듈 및 I/O 핀 결선 장애 혹은 카메라 접근 에러 발생. 콘솔 디버그 로그를 참고하여 연결을 진단하세요.")
                     
                     print(" -> 에러 리포트 가이드 제공 시작 (비차단식 5초 버퍼 가동)")
                     result_displayed = True

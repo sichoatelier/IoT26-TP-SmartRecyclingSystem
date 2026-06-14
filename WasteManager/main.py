@@ -107,7 +107,7 @@ class I2CLCD:
 # 4. 온습도 센서 (DHT11) 나노초 정밀 수집 함수
 # ==========================================
 def read_dht11_detailed():
-    """도커 컨테이너 지연을 극복하기 위한 나노초 단위 절대 시간 변동 측정 수행."""
+    """도커 컨테이너 지연을 극복하기 위한 나노초 단위 절대 시간 변동 측정."""
     timestamps = []
     values = []
     
@@ -192,7 +192,7 @@ def read_dht11_detailed():
         return None, None, "체크섬 불일치 (데이터 깨짐)"
 
 # ==========================================
-# 5. 초음파 센서 (HC-SR04) 거리 측정 함수
+# 5. 검증된 초음파 센서 (HC-SR04) 거리 측정 함수
 # ==========================================
 def get_ultrasonic_distance():
     """
@@ -249,7 +249,7 @@ def get_ultrasonic_distance():
 # ==========================================
 def initialize_ai_model():
     """
-    NCNN 기반 가속 모델을 우선적으로 로드하고, 없을 경우 PT 모델을 컴파일하여 내보냄.
+    NCNN 기반 가속 모델을 우선적으로 로드하고, 없을 경우 PT 모델을 컴파일하여 내보냅니다.
     """
     print("\n[AI 모델 초기화] 가중치 로드 시도 중...")
     if os.path.exists(NCNN_MODEL_DIR):
@@ -341,10 +341,10 @@ def main():
                         print(f"[{now_str}] 온습도 감지 대기 중 (원인: {status})")
                     last_dht_time = current_time
                 
-                # 초음파를 통해 사용자의 접근(손/몸) 감지
+                # 초음파를 통해 쓰레기가 아닌 '사용자의 접근(손/몸)' 감지
                 dist = get_ultrasonic_distance()
                 if 0.0 < dist <= 7.0:
-                    print(f"\n[사용자 접근 감지] {dist}cm에 사용자 감지. 즉시 카메라 캡처를 실행합니다.")
+                    print(f"\n[사용자 접근 감지] {dist}cm에 사용자 감지! 즉시 카메라 캡처를 실행합니다.")
                     current_state = STATE_SCANNING
 
             # ==========================================
@@ -378,7 +378,7 @@ def main():
                     lcd.display_text("  ANALYZING...  ", lcd.LCD_LINE_2)
                     
                 except Exception as e:
-                    print(f" 카메라 캡처 중 하드웨어 장애 발생: {e}")
+                    print(f"카메라 캡처 중 하드웨어 장애 발생: {e}")
                     current_state = STATE_RESULT_ERROR
                     error_reason = "SYSTEM_FAULT"
                     state_entry_time = time.time()
@@ -391,18 +391,25 @@ def main():
                     detected_item = None
                     max_conf = 0.0
                     
-                    # 수집된 Bounding Box 분석
-                    for result in results:
-                        boxes = result.boxes
-                        for box in boxes:
-                            conf = float(box.conf[0])
-                            # 신뢰도 임계값(Threshold)을 상회하고 가장 신뢰도가 높은 탑 클래스 선정
-                            if conf >= CONFIDENCE_THRESHOLD and conf > max_conf:
-                                max_conf = conf
-                                class_id = int(box.cls[0])
-                                detected_item = result.names[class_id].lower()
+                    if len(results) > 0:
+                        result = results[0]
+                        
+                        # [핵심 변경] YOLO 이미지 분류(Classification) 모델인 경우 (result.probs 속성 존재)
+                        if hasattr(result, 'probs') and result.probs is not None:
+                            class_id = int(result.probs.top1)
+                            max_conf = float(result.probs.top1conf)
+                            detected_item = result.names[class_id].lower()
+                            
+                        # [하이브리드 호환 예비용] YOLO 객체 탐지(Detection) 모델인 경우 (result.boxes 속성 존재)
+                        elif hasattr(result, 'boxes') and result.boxes is not None and len(result.boxes) > 0:
+                            for box in result.boxes:
+                                conf = float(box.conf[0])
+                                if conf > max_conf:
+                                    max_conf = conf
+                                    class_id = int(box.cls[0])
+                                    detected_item = result.names[class_id].lower()
                     
-                    if detected_item:
+                    if detected_item and max_conf >= CONFIDENCE_THRESHOLD:
                         print(f" -> 탐지 성공: '{detected_item}' (신뢰도: {max_conf * 100:.1f}%)")
                         current_state = STATE_RESULT_SUCCESS
                         success_item_name = detected_item
@@ -410,8 +417,11 @@ def main():
                         result_displayed = False
                     else:
                         # 신뢰도 미달 혹은 객체 없음 분류
-                        if len(results) > 0 and len(results[0].boxes) > 0:
-                            print(" -> 탐지 실패: 물체를 발견했으나 신뢰도가 기준선(50%) 미만입니다.")
+                        if len(results) > 0 and (
+                            (hasattr(results[0], 'probs') and results[0].probs is not None) or 
+                            (hasattr(results[0], 'boxes') and results[0].boxes is not None and len(results[0].boxes) > 0)
+                        ):
+                            print(f" -> 탐지 실패: 물체를 감지했으나 신뢰도({max_conf * 100:.1f}%)가 기준선(50%) 미만입니다.")
                             current_state = STATE_RESULT_ERROR
                             error_reason = "LOW_CONFIDENCE"
                         else:
@@ -422,7 +432,7 @@ def main():
                         result_displayed = False
                             
                 except Exception as e:
-                    print(f" YOLO 인퍼런스 엔진 가동 중 심각한 예외 발생: {e}")
+                    print(f"YOLO 인퍼런스 엔진 가동 중 심각한 예외 발생: {e}")
                     current_state = STATE_RESULT_ERROR
                     error_reason = "SYSTEM_FAULT"
                     state_entry_time = time.time()
@@ -434,23 +444,22 @@ def main():
             elif current_state == STATE_RESULT_SUCCESS:
                 if not result_displayed:
                     lcd.clear()
-                    # 수거함은 단 하나이므로, 쓰레기 종류별 "분리배출 요령(전처리 행동)"을 동적으로 제공
                     if "bottle" in success_item_name or "plastic" in success_item_name:
                         lcd.display_text("PLASTIC BOTTLE", lcd.LCD_LINE_1)
                         lcd.display_text("REMOVE CAP&LABEL", lcd.LCD_LINE_2)
-                        print("가이드: [플라스틱] 비닐 라벨과 플라스틱 뚜껑을 완전히 떼어내고 압착해야합니다.")
+                        print("가이드: [플라스틱] 비닐 라벨과 플라스틱 뚜껑을 완전히 떼어내고 압착해주세요.")
                     elif "can" in success_item_name or "metal" in success_item_name:
                         lcd.display_text("CAN & METAL WST", lcd.LCD_LINE_1)
                         lcd.display_text("EMPTY & FLATTEN", lcd.LCD_LINE_2)
-                        print("가이드: [캔/메탈] 내부 잔여물을 깨끗이 비우고 찌그러뜨려야합니다.")
+                        print("가이드: [캔/메탈] 내부 잔여물을 깨끗이 비우고 찌그러뜨려주세요.")
                     elif "paper" in success_item_name or "cardboard" in success_item_name:
                         lcd.display_text("PAPER / BOX WST", lcd.LCD_LINE_1)
                         lcd.display_text("REMOVE TAPE&FOLD", lcd.LCD_LINE_2)
-                        print("가이드: [종이류] 박스의 비닐 테이프와 이물질을 완전히 뜯고 평평하게 접어야합니다.")
+                        print("가이드: [종이류] 박스의 비닐 테이프와 이물질을 완전히 뜯고 평평하게 접어주세요.")
                     elif "glass" in success_item_name:
                         lcd.display_text("GLASS BOTTLE", lcd.LCD_LINE_1)
                         lcd.display_text("RINSE WITH WATER", lcd.LCD_LINE_2)
-                        print("가이드: [유리병] 내용물을 가볍게 헹군 뒤 깨지지 않도록 배출해주세요.")
+                        print("가이드: [유리병] 내용물을 가볍게 헹군 뒤 깨지지 않도록 배출해 주세요.")
                     else:
                         lcd.display_text("GENERAL TRASH", lcd.LCD_LINE_1)
                         lcd.display_text("PUT IN THE BIN", lcd.LCD_LINE_2)

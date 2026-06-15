@@ -30,7 +30,7 @@ ECHO_PIN = 24
 DHT_PIN = 17   
 
 # 상태 표시 LED 핀 설정 (상태등)
-LED_PIN_R = 19
+LED_PIN_R = 5
 LED_PIN_Y = 13
 LED_PIN_G = 6
 
@@ -40,7 +40,10 @@ RGB_PIN_G = 20
 RGB_PIN_B = 21
 
 # 서보모터 핀 설정 (분리배출 판 기울임용)
-SERVO_PIN = 25
+SERVO_PIN = 18
+
+# 입구 개폐용 서보모터 핀 설정
+ENTRY_SERVO_PIN = 19
 
 # I2C LCD 설정
 LCD_ADDRESS = 0x27  
@@ -943,6 +946,7 @@ def main():
     lcd = I2CLCD(address=LCD_ADDRESS, bus_num=I2C_BUS)
     led = LEDController(CHIP_PATH, LED_PIN_R, LED_PIN_Y, LED_PIN_G, RGB_PIN_R, RGB_PIN_G, RGB_PIN_B)
     servo = ServoController(CHIP_PATH, SERVO_PIN)
+    entry_servo = ServoController(CHIP_PATH, ENTRY_SERVO_PIN)
     
     lcd.set_message("  AIoT SYSTEM  ", lcd.LCD_LINE_1)
     lcd.set_message("   INITIAL...   ", lcd.LCD_LINE_2)
@@ -954,6 +958,8 @@ def main():
     # 시스템 시작 시 서보모터를 기본 수평 각도(90도)로 맞춤
     debug_print("SERVO", "시스템 시작 시 기본 위치(90도)로 이동")
     servo.set_angle(90, duration=1.0)
+    debug_print("ENTRY_SERVO", "시스템 시작 시 입구를 닫는 0도로 설정")
+    entry_servo.set_angle(0, duration=1.0)
     
     last_dht_time = 0      
     state_entry_time = 0
@@ -1096,6 +1102,9 @@ def main():
                         "SERVO",
                         f"분류 결과 반영: success_item_name={success_item_name}, target_angle={target_angle}, state={current_state}"
                     )
+
+                    debug_print("ENTRY_SERVO", "분류 성공 감지로 입구 개방(180도)")
+                    entry_servo.set_angle(180, duration=0.8)
                     
                     # 4단계: 쓰레기 분류 결과 및 모터 서보 구동 각도를 SQLite3 데이터베이스에 로깅
                     log_waste_event(success_item_name, target_angle)
@@ -1111,6 +1120,9 @@ def main():
                     lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
                     print(" -> 배출 완료. 판을 기본 각도(90도)로 복귀합니다.\n")
                     
+                    debug_print("ENTRY_SERVO", "대기 모드 복귀로 입구 닫기(0도)")
+                    entry_servo.set_angle(0, duration=0.8)
+
                     # 다음 쓰레기 측정을 위해 판을 다시 수평으로 복귀
                     debug_print("SERVO", "대기 상태 복귀 전 기본 위치(90도)로 되돌림")
                     servo.set_angle(90, duration=1.0)
@@ -1149,6 +1161,7 @@ def main():
         lcd.clear()
         led.cleanup()
         servo.cleanup()
+        entry_servo.cleanup()
 
 if __name__ == "__main__":
     main()

@@ -26,6 +26,19 @@ TRIG_PIN = 23
 ECHO_PIN = 24  
 DHT_PIN = 17   
 
+# 상태 표시 LED 핀 설정 (상태등)
+LED_PIN_R = 19
+LED_PIN_Y = 13
+LED_PIN_G = 6
+
+# 3색 RGB LED 핀 설정 (조명용)
+RGB_PIN_R = 16
+RGB_PIN_G = 20
+RGB_PIN_B = 21
+
+# 서보모터 핀 설정 (분리배출 판 기울임용)
+SERVO_PIN = 25
+
 # I2C LCD 설정
 LCD_ADDRESS = 0x27  
 I2C_BUS = 1
@@ -36,10 +49,14 @@ if not os.path.exists(SAVE_DIR):
     SAVE_DIR = os.getcwd()  
 
 TEMP_IMAGE_PATH = os.path.join(SAVE_DIR, "captured_waste.jpg")
-
-# 컨테이너에 띄워둔 FastAPI 서버 주소
 API_URL = "http://localhost:8000/predict"
 CONFIDENCE_THRESHOLD = 0.5  
+SERVO_DEBUG = True
+
+
+def debug_print(tag, message):
+    if SERVO_DEBUG:
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}][{tag}] {message}", flush=True)
 
 # ==========================================
 # 3. I2C 16x2 LCD 드라이버 클래스
@@ -153,22 +170,147 @@ class I2CLCD:
         time.sleep(0.005)
 
 # ==========================================
-# 4. 온습도 센서 (DHT11) 함수
+# 4. LED 상태 컨트롤러 클래스
+# ==========================================
+class LEDController:
+    def __init__(self, chip_path, pin_r, pin_y, pin_g, rgb_r, rgb_g, rgb_b):
+        self.pin_r = pin_r
+        self.pin_y = pin_y
+        self.pin_g = pin_g
+        self.rgb_r = rgb_r
+        self.rgb_g = rgb_g
+        self.rgb_b = rgb_b
+        
+        self.req = gpiod.request_lines(
+            chip_path,
+            consumer="Status_And_RGB_LEDs",
+            config={
+                self.pin_r: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE),
+                self.pin_y: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE),
+                self.pin_g: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE),
+                self.rgb_r: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE),
+                self.rgb_g: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE),
+                self.rgb_b: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE)
+            }
+        )
+        self.state = STATE_IDLE
+        self.last_toggle_time = time.time()
+        self.yellow_on = False
+        
+    def set_state(self, state):
+        self.state = state
+        if state == STATE_IDLE:
+            self.req.set_values({self.pin_r: Value.INACTIVE, self.pin_y: Value.ACTIVE, self.pin_g: Value.INACTIVE})
+            self.req.set_values({self.rgb_r: Value.ACTIVE, self.rgb_g: Value.ACTIVE, self.rgb_b: Value.ACTIVE})
+            self.yellow_on = True
+            self.last_toggle_time = time.time()
+        elif state == STATE_SCANNING:
+            self.req.set_values({self.pin_r: Value.INACTIVE, self.pin_y: Value.ACTIVE, self.pin_g: Value.INACTIVE})
+            self.yellow_on = True
+            self.last_toggle_time = time.time()
+        elif state == STATE_RESULT_SUCCESS:
+            self.req.set_values({self.pin_r: Value.INACTIVE, self.pin_y: Value.INACTIVE, self.pin_g: Value.ACTIVE})
+            self.turn_off_rgb()
+        elif state == STATE_RESULT_ERROR:
+            self.req.set_values({self.pin_r: Value.ACTIVE, self.pin_y: Value.INACTIVE, self.pin_g: Value.INACTIVE})
+            self.turn_off_rgb()
+
+    def turn_off_rgb(self):
+        self.req.set_values({self.rgb_r: Value.INACTIVE, self.rgb_g: Value.INACTIVE, self.rgb_b: Value.INACTIVE})
+
+    def update(self):
+        if self.state in [STATE_IDLE, STATE_SCANNING]:
+            if time.time() - self.last_toggle_time >= 0.5:
+                self.yellow_on = not self.yellow_on
+                val = Value.ACTIVE if self.yellow_on else Value.INACTIVE
+                self.req.set_value(self.pin_y, val)
+                self.last_toggle_time = time.time()
+
+    def cleanup(self):
+        self.req.set_values({
+            self.pin_r: Value.INACTIVE, self.pin_y: Value.INACTIVE, self.pin_g: Value.INACTIVE,
+            self.rgb_r: Value.INACTIVE, self.rgb_g: Value.INACTIVE, self.rgb_b: Value.INACTIVE
+        })
+        self.req.release()
+
+# ==========================================
+# 5. 서보 모터 컨트롤러 클래스
+# ==========================================
+class ServoController:
+    def __init__(self, chip_path, pin):
+        self.pin = pin
+        debug_print("SERVO", f"초기화 시작: chip_path={chip_path}, pin={pin}")
+        try:
+            self.req = gpiod.request_lines(
+                chip_path,
+                consumer="Servo",
+                config={self.pin: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE)}
+            )
+            debug_print("SERVO", "GPIO 라인 요청 성공")
+        except Exception as e:
+            debug_print("SERVO", f"GPIO 라인 요청 실패: {e}")
+            raise
+        
+    def set_angle(self, angle, duration=1.0):
+        debug_print("SERVO", f"set_angle 호출: angle={angle}, duration={duration}")
+
+        if angle < 0:
+            debug_print("SERVO", f"angle 값이 낮아 0도로 보정: {angle}")
+            angle = 0
+        elif angle > 180:
+            debug_print("SERVO", f"angle 값이 높아 180도로 보정: {angle}")
+            angle = 180
+
+        # SG90 및 일반 서보모터 스펙 (0도: 0.5ms, 180도: 2.5ms) 적용
+        pulse_width = 0.0005 + (angle / 180.0) * 0.002
+        period = 0.020  # 50Hz
+        low_time = period - pulse_width
+
+        debug_print(
+            "SERVO",
+            f"PWM 계산 완료: pulse_width={pulse_width:.6f}s, low_time={low_time:.6f}s, period={period:.6f}s"
+        )
+
+        if low_time <= 0:
+            debug_print("SERVO", f"비정상 PWM 계산: low_time={low_time:.6f}s, angle={angle}")
+            return
+        
+        # duration 동안 소프트웨어 PWM 루프 실행 (판을 움직일 시간을 줌)
+        end_time = time.time() + duration
+        loop_count = 0
+        while time.time() < end_time:
+            loop_count += 1
+            self.req.set_value(self.pin, Value.ACTIVE)
+            time.sleep(pulse_width)
+            self.req.set_value(self.pin, Value.INACTIVE)
+            time.sleep(low_time)
+
+        debug_print("SERVO", f"set_angle 종료: angle={angle}, duration={duration}, loop_count={loop_count}")
+
+    def cleanup(self):
+        debug_print("SERVO", "cleanup 시작")
+        self.req.set_value(self.pin, Value.INACTIVE)
+        self.req.release()
+        debug_print("SERVO", "cleanup 완료")
+
+# ==========================================
+# 6. 온습도 센서 (DHT11) 함수
 # ==========================================
 def read_dht11_detailed():
+    # ... (기존 코드와 동일) ...
     timestamps = []
     values = []
     try:
         with gpiod.request_lines(
             CHIP_PATH,
             consumer="DHT11",
-            config={DHT_PIN: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT, output_value=gpiod.line.Value.ACTIVE)}
+            config={DHT_PIN: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.ACTIVE)}
         ) as lines:
-            lines.set_value(DHT_PIN, gpiod.line.Value.INACTIVE)
+            lines.set_value(DHT_PIN, Value.INACTIVE)
             time.sleep(0.018)
-            lines.set_value(DHT_PIN, gpiod.line.Value.ACTIVE)
+            lines.set_value(DHT_PIN, Value.ACTIVE)
             time.sleep(0.00004)
-            lines.reconfigure_lines(config={DHT_PIN: gpiod.LineSettings(direction=gpiod.line.Direction.INPUT)})
+            lines.reconfigure_lines(config={DHT_PIN: gpiod.LineSettings(direction=Direction.INPUT)})
             
             get_val = lines.get_value
             pin = DHT_PIN
@@ -214,9 +356,10 @@ def read_dht11_detailed():
     else: return None, None, "체크섬 불일치"
 
 # ==========================================
-# 5. 초음파 센서 (HC-SR04) 함수
+# 7. 초음파 센서 (HC-SR04) 함수
 # ==========================================
 def get_ultrasonic_distance():
+    # ... (기존 코드와 동일) ...
     try:
         with gpiod.request_lines(
             CHIP_PATH,
@@ -250,51 +393,49 @@ def get_ultrasonic_distance():
         return -1.0
 
 # ==========================================
-# 6. 카메라 제어 (CLI 유틸리티 전용 - OpenCV 완전 제거)
+# 8. 카메라 제어 
 # ==========================================
 def capture_single_frame(output_path):
-    """
-    라즈베리파이 5의 네이티브 카메라 툴을 사용하여 OpenCV 없이 가볍게 캡처합니다.
-    --width, --height 옵션으로 크기를 줄이고, --rotation 옵션으로 180도 회전을 바로 적용합니다.
-    """
+    # ... (기존 코드와 동일) ...
     print("[CAM_DEBUG] 시스템 기본 카메라 툴을 사용하여 캡처를 시도합니다...")
-    
     commands = [
-        # rpicam-still (Raspberry Pi 5 기본)
         ["rpicam-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "--rotation", "180", "-o", output_path],
-        # libcamera-still (호환성 목적)
         ["libcamera-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "--rotation", "180", "-o", output_path]
     ]
-    
     for cmd in commands:
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5.0)
-            # 캡처 성공 시 파일이 정상적으로 생성되었는지 확인
             if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 print(f"[CAM_DEBUG] [SUCCESS] 이미지 캡처 완료: {output_path}")
                 return True
         except Exception as e:
-            print(f"[CAM_DEBUG] 명령어({cmd[0]}) 실행 중 오류: {e}")
             pass
-
     print("[CAM_DEBUG] [FATAL] 카메라 캡처에 실패했습니다.")
     return False
 
-
 # ==========================================
-# 7. 메인 통합 관제 및 상태 기계 구동 루프
+# 9. 메인 통합 관제 및 상태 기계 구동 루프
 # ==========================================
 def main():
     print("=" * 60)
-    print("AIoT 스마트 분리수거 시스템 (Lightweight API Client)")
+    print("AIoT 스마트 분리수거 시스템 (Camera + Servo + LED)")
     print("=" * 60)
     
     lcd = I2CLCD(address=LCD_ADDRESS, bus_num=I2C_BUS)
+    led = LEDController(CHIP_PATH, LED_PIN_R, LED_PIN_Y, LED_PIN_G, RGB_PIN_R, RGB_PIN_G, RGB_PIN_B)
+    servo = ServoController(CHIP_PATH, SERVO_PIN)
+    
     lcd.set_message("  AIoT SYSTEM  ", lcd.LCD_LINE_1)
     lcd.set_message("   INITIAL...   ", lcd.LCD_LINE_2)
     time.sleep(1.0)
 
     current_state = STATE_IDLE
+    led.set_state(STATE_IDLE) 
+    
+    # 시스템 시작 시 서보모터를 기본 수평 각도(90도)로 맞춤
+    debug_print("SERVO", "시스템 시작 시 기본 위치(90도)로 이동")
+    servo.set_angle(90, duration=1.0)
+    
     last_dht_time = 0      
     state_entry_time = 0
     result_displayed = False
@@ -310,6 +451,7 @@ def main():
         while True:
             current_time = time.time()
             lcd.update_scroll()
+            led.update() 
             
             # [상태 1] STATE_IDLE
             if current_state == STATE_IDLE:
@@ -323,6 +465,7 @@ def main():
                 if 0.0 < dist <= 7.0:
                     print(f"\n[트리거 작동] {dist}cm에 사용자 감지! 카메라 캡처를 실행합니다.")
                     current_state = STATE_SCANNING
+                    led.set_state(STATE_SCANNING) 
 
             # [상태 2] STATE_SCANNING: 촬영 및 API 서버 전송
             elif current_state == STATE_SCANNING:
@@ -330,11 +473,13 @@ def main():
                 lcd.set_message(" USER DETECTED! ", lcd.LCD_LINE_1)
                 lcd.set_message("  CAPTURING...  ", lcd.LCD_LINE_2)
                 
-                # 가벼워진 캡처 함수 호출
                 ret = capture_single_frame(TEMP_IMAGE_PATH)
+                led.turn_off_rgb()
+                
                 if not ret:
                     print(" [SYSTEM_ALERT] 카메라 이미지 프레임을 가져오지 못했습니다.")
                     current_state = STATE_RESULT_ERROR
+                    led.set_state(STATE_RESULT_ERROR)
                     error_reason = "SYSTEM_FAULT"
                     state_entry_time = time.time()
                     result_displayed = False
@@ -364,60 +509,89 @@ def main():
                         if max_conf >= CONFIDENCE_THRESHOLD:
                             print(f" -> 탐지 성공: '{detected_item}' (신뢰도: {max_conf * 100:.1f}%)")
                             current_state = STATE_RESULT_SUCCESS
+                            led.set_state(STATE_RESULT_SUCCESS)
                             success_item_name = detected_item
                         else:
                             print(f" -> 탐지 실패: 물체를 감지했으나 신뢰도({max_conf * 100:.1f}%)가 기준 미달입니다.")
                             current_state = STATE_RESULT_ERROR
+                            led.set_state(STATE_RESULT_ERROR)
                             error_reason = "LOW_CONFIDENCE"
                     else:
                         print(" -> 탐지 실패: 서버에서 예측 데이터가 오지 않았습니다.")
                         current_state = STATE_RESULT_ERROR
+                        led.set_state(STATE_RESULT_ERROR)
                         error_reason = "NO_OBJECT"
 
                 except requests.exceptions.RequestException as e:
                     print(f" [API_ERROR] 서버 통신 실패: {e}")
                     current_state = STATE_RESULT_ERROR
+                    led.set_state(STATE_RESULT_ERROR)
                     error_reason = "SYSTEM_FAULT"
 
                 state_entry_time = time.time()
                 result_displayed = False
 
-            # [상태 3] STATE_RESULT_SUCCESS: 커스텀 클래스 가이드 제공
+            # [상태 3] STATE_RESULT_SUCCESS
             elif current_state == STATE_RESULT_SUCCESS:
                 if not result_displayed:
                     lcd.clear()
+                    target_angle = 90  # 기본값
+                    
+                    # ----------------------------------------------------
+                    # 서보모터 각도 맵핑 라우팅 (총 4개 방향)
+                    # ----------------------------------------------------
                     if success_item_name == "plastico":
+                        target_angle = 35
                         lcd.set_message("PLASTIC BOTTLE", lcd.LCD_LINE_1)
                         lcd.set_message("REMOVE CAP&LABEL", lcd.LCD_LINE_2)
-                        print("가이드: [플라스틱] 비닐 라벨과 플라스틱 뚜껑을 완전히 떼어내고 압착하세요.")
+                        print("가이드: [플라스틱] -> 35도 각도로 배출합니다.")
                     elif success_item_name == "metal":
+                        target_angle = 75
                         lcd.set_message("CAN & METAL WST", lcd.LCD_LINE_1)
                         lcd.set_message("EMPTY & FLATTEN", lcd.LCD_LINE_2)
-                        print("가이드: [캔/메탈] 내부 잔여물을 깨끗이 비우고 찌그러뜨리세요.")
+                        print("가이드: [캔/메탈] -> 75도 각도로 배출합니다.")
                     elif success_item_name == "papel_y_carton":
+                        target_angle = 105
                         lcd.set_message("PAPER / BOX WST", lcd.LCD_LINE_1)
                         lcd.set_message("REMOVE TAPE&FOLD", lcd.LCD_LINE_2)
-                        print("가이드: [종이/박스류] 비닐 테이프와 이물질을 뜯고 평평하게 접으세요.")
-                    elif success_item_name == "vidrio":
-                        lcd.set_message("GLASS BOTTLE", lcd.LCD_LINE_1)
-                        lcd.set_message("RINSE WITH WATER", lcd.LCD_LINE_2)
-                        print("가이드: [유리병] 내용물을 헹군 뒤 깨지지 않게 주의하여 배출하세요.")
-                    elif success_item_name == "organico":
-                        lcd.set_message("ORGANIC WASTE", lcd.LCD_LINE_1)
-                        lcd.set_message("DRAIN WATER OUT", lcd.LCD_LINE_2)
-                        print("가이드: [음식물/유기물] 물기를 완전히 제거한 후 전용 수거함에 버리세요.")
+                        print("가이드: [종이/박스류] -> 105도 각도로 배출합니다.")
+                    elif success_item_name in ["vidrio", "organico"]:
+                        target_angle = 145
+                        if success_item_name == "vidrio":
+                            lcd.set_message("GLASS BOTTLE", lcd.LCD_LINE_1)
+                            lcd.set_message("RINSE WITH WATER", lcd.LCD_LINE_2)
+                        else:
+                            lcd.set_message("ORGANIC WASTE", lcd.LCD_LINE_1)
+                            lcd.set_message("DRAIN WATER OUT", lcd.LCD_LINE_2)
+                        print(f"가이드: [{success_item_name}] -> 145도 각도로 배출합니다.")
                     else:
+                        target_angle = 145
                         lcd.set_message("GENERAL TRASH", lcd.LCD_LINE_1)
                         lcd.set_message("STANDARD DISPOSE", lcd.LCD_LINE_2)
-                        
+                        print("가이드: [일반쓰레기] -> 145도 각도로 배출합니다.")
+
+                    debug_print(
+                        "SERVO",
+                        f"분류 결과 반영: success_item_name={success_item_name}, target_angle={target_angle}, state={current_state}"
+                    )
+                    
+                    # 판 기울이기 (동작 시간 약 1초 소요)
+                    servo.set_angle(target_angle, duration=1.0)
                     result_displayed = True
 
+                # 상태 진입 후 5초 경과 시 다시 대기 상태로 복귀
                 if current_time - state_entry_time >= 5.0:
                     lcd.clear()
                     lcd.set_message("PLACE WASTE FIRST", lcd.LCD_LINE_1)
                     lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
-                    print(" -> 시스템 상태 복원 완료. [현재 상태: IDLE]\n")
+                    print(" -> 배출 완료. 판을 기본 각도(90도)로 복귀합니다.\n")
+                    
+                    # 다음 쓰레기 측정을 위해 판을 다시 수평으로 복귀
+                    debug_print("SERVO", "대기 상태 복귀 전 기본 위치(90도)로 되돌림")
+                    servo.set_angle(90, duration=1.0)
+                    
                     current_state = STATE_IDLE
+                    led.set_state(STATE_IDLE)
 
             # [상태 4] STATE_RESULT_ERROR
             elif current_state == STATE_RESULT_ERROR:
@@ -440,6 +614,7 @@ def main():
                     lcd.set_message("PLACE WASTE FIRST", lcd.LCD_LINE_1)
                     lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
                     current_state = STATE_IDLE
+                    led.set_state(STATE_IDLE)
 
             time.sleep(0.05)
 
@@ -447,6 +622,8 @@ def main():
         print("\n사용자에 의해 시스템이 안전 종료됩니다.")
     finally:
         lcd.clear()
+        led.cleanup()
+        servo.cleanup()
 
 if __name__ == "__main__":
     main()

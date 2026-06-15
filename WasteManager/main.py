@@ -3,11 +3,10 @@ import sys
 import time
 import subprocess
 from datetime import datetime
-import requests  # 서버와 HTTP 통신을 위한 라이브러리 (추가됨)
+import requests  
 import gpiod
 from gpiod.line import Direction, Value
 from smbus2 import SMBus
-import cv2
 
 # ==========================================
 # 1. 시스템 상태 기계 (State Machine) 상태 정의
@@ -38,10 +37,9 @@ if not os.path.exists(SAVE_DIR):
 
 TEMP_IMAGE_PATH = os.path.join(SAVE_DIR, "captured_waste.jpg")
 
-# 컨테이너에 띄워둔 FastAPI 서버 주소 (호스트 포트 8000 기준)
+# 컨테이너에 띄워둔 FastAPI 서버 주소
 API_URL = "http://localhost:8000/predict"
-
-CONFIDENCE_THRESHOLD = 0.5  # 인공지능 분석 신뢰도 커트라인 (50%)
+CONFIDENCE_THRESHOLD = 0.5  
 
 # ==========================================
 # 3. I2C 16x2 LCD 드라이버 클래스
@@ -155,7 +153,7 @@ class I2CLCD:
         time.sleep(0.005)
 
 # ==========================================
-# 4. 온습도 센서 (DHT11) 함수 (기존과 동일)
+# 4. 온습도 센서 (DHT11) 함수
 # ==========================================
 def read_dht11_detailed():
     timestamps = []
@@ -216,7 +214,7 @@ def read_dht11_detailed():
     else: return None, None, "체크섬 불일치"
 
 # ==========================================
-# 5. 초음파 센서 (HC-SR04) 함수 (기존과 동일)
+# 5. 초음파 센서 (HC-SR04) 함수
 # ==========================================
 def get_ultrasonic_distance():
     try:
@@ -252,96 +250,43 @@ def get_ultrasonic_distance():
         return -1.0
 
 # ==========================================
-# 6. 카메라 제어 (호스트 직접 제어 - 동일하게 유지)
+# 6. 카메라 제어 (CLI 유틸리티 전용 - OpenCV 완전 제거)
 # ==========================================
 def capture_single_frame(output_path):
-    print("[CAM_DEBUG] 호스트 카메라 제어를 시작합니다...")
-    # 1. Picamera2 시도
-    try:
-        from picamera2 import Picamera2
-        picam = Picamera2()
-        config = picam.create_still_configuration(main={"size": (640, 480)})
-        picam.configure(config)
-        picam.start()
-        picam.capture_file(output_path)
-        picam.stop()
-        picam.close()
-        saved_frame = cv2.imread(output_path)
-        if saved_frame is not None:
-            return process_and_save_frame(saved_frame, output_path)
-    except Exception: pass
-
-    # 2. CLI 툴 시도
+    """
+    라즈베리파이 5의 네이티브 카메라 툴을 사용하여 OpenCV 없이 가볍게 캡처합니다.
+    --width, --height 옵션으로 크기를 줄이고, --rotation 옵션으로 180도 회전을 바로 적용합니다.
+    """
+    print("[CAM_DEBUG] 시스템 기본 카메라 툴을 사용하여 캡처를 시도합니다...")
+    
     commands = [
-        ["rpicam-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "-o", output_path],
-        ["libcamera-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "-o", output_path]
+        # rpicam-still (Raspberry Pi 5 기본)
+        ["rpicam-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "--rotation", "180", "-o", output_path],
+        # libcamera-still (호환성 목적)
+        ["libcamera-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "--rotation", "180", "-o", output_path]
     ]
+    
     for cmd in commands:
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5.0)
-            if res.returncode == 0 and os.path.exists(output_path):
-                saved_frame = cv2.imread(output_path)
-                if saved_frame is not None:
-                    return process_and_save_frame(saved_frame, output_path)
-        except Exception: pass
+            # 캡처 성공 시 파일이 정상적으로 생성되었는지 확인
+            if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                print(f"[CAM_DEBUG] [SUCCESS] 이미지 캡처 완료: {output_path}")
+                return True
+        except Exception as e:
+            print(f"[CAM_DEBUG] 명령어({cmd[0]}) 실행 중 오류: {e}")
+            pass
 
-    # 3. V4L2 다이렉트 (안전형)
-    video_devices = [0, 1]
-    for dev_idx in video_devices:
-        cap = None
-        try:
-            cap = cv2.VideoCapture(dev_idx, cv2.CAP_V4L2)
-            if not cap.isOpened(): continue
-            time.sleep(0.8)
-            frame_grabbed = False
-            for i in range(15):
-                if cap.grab():
-                    frame_grabbed = True
-                    break
-                time.sleep(0.1)
-            if frame_grabbed:
-                ret, frame = cap.retrieve()
-                if ret and frame is not None:
-                    success = process_and_save_frame(frame, output_path)
-                    cap.release()
-                    return success
-            cap.release()
-        except Exception:
-            if cap: cap.release()
-
-    print("[CAM_DEBUG] [FATAL] 프레임 획득 실패.")
+    print("[CAM_DEBUG] [FATAL] 카메라 캡처에 실패했습니다.")
     return False
 
-def process_and_save_frame(frame, output_path):
-    try:
-        frame = cv2.rotate(frame, cv2.ROTATE_180)
-        # 네트워크 전송 속도 향상을 위해 640x640 고정 리사이즈 패딩
-        h, w = frame.shape[:2]
-        if h != 640 or w != 640:
-            scale = 640.0 / max(h, w)
-            resized_frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
-            final_square = cv2.copyMakeBorder(
-                resized_frame,
-                top=(640 - resized_frame.shape[0]) // 2,
-                bottom=640 - resized_frame.shape[0] - ((640 - resized_frame.shape[0]) // 2),
-                left=(640 - resized_frame.shape[1]) // 2,
-                right=640 - resized_frame.shape[1] - ((640 - resized_frame.shape[1]) // 2),
-                borderType=cv2.BORDER_CONSTANT, value=[0, 0, 0]
-            )
-            frame = final_square
-            
-        cv2.imwrite(output_path, frame)
-        return True
-    except Exception as e:
-        print(f"[CAM_DEBUG] [ERROR] 이미지 처리 오류: {e}")
-        return False
 
 # ==========================================
 # 7. 메인 통합 관제 및 상태 기계 구동 루프
 # ==========================================
 def main():
     print("=" * 60)
-    print("AIoT 스마트 분리수거 시스템 - API 기반 모듈화 구조 적용")
+    print("AIoT 스마트 분리수거 시스템 (Lightweight API Client)")
     print("=" * 60)
     
     lcd = I2CLCD(address=LCD_ADDRESS, bus_num=I2C_BUS)
@@ -359,7 +304,7 @@ def main():
     lcd.set_message("PLACE WASTE FIRST", lcd.LCD_LINE_1)
     lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
     print("\n상태 기계 구동 엔진 가동 중... [현재 상태: IDLE]")
-    print(f" -> AI 모델 서버 주소: {API_URL}")
+    print(f" -> 통신 대상 서버: {API_URL}")
 
     try:
         while True:
@@ -385,6 +330,7 @@ def main():
                 lcd.set_message(" USER DETECTED! ", lcd.LCD_LINE_1)
                 lcd.set_message("  CAPTURING...  ", lcd.LCD_LINE_2)
                 
+                # 가벼워진 캡처 함수 호출
                 ret = capture_single_frame(TEMP_IMAGE_PATH)
                 if not ret:
                     print(" [SYSTEM_ALERT] 카메라 이미지 프레임을 가져오지 못했습니다.")
@@ -400,20 +346,17 @@ def main():
                 
                 print(f" -> 컨테이너 서버({API_URL})로 이미지 전송 중...")
                 try:
-                    # 이미지 파일을 Multipart-Form 데이터로 서버에 전송
                     with open(TEMP_IMAGE_PATH, "rb") as image_file:
                         files = {"file": ("captured_waste.jpg", image_file, "image/jpeg")}
                         response = requests.post(API_URL, files=files, timeout=10.0)
-                        response.raise_for_status() # 200번대 응답이 아닐 경우 예외 발생
+                        response.raise_for_status() 
                         
-                    # JSON 결과 파싱
                     api_result = response.json()
                     predictions = api_result.get("predictions", [])
                     server_time = api_result.get("processing_time_sec", 0)
                     print(f" -> 서버 처리 완료 (응답시간: {server_time}초)")
 
                     if predictions:
-                        # Classification 모델의 Top-1 결과 추출
                         best_pred = predictions[0]
                         detected_item = best_pred["class_name"]
                         max_conf = best_pred["confidence"]
@@ -427,13 +370,12 @@ def main():
                             current_state = STATE_RESULT_ERROR
                             error_reason = "LOW_CONFIDENCE"
                     else:
-                        print(" -> 탐지 실패: 서버에서 반환된 예측 데이터가 없습니다.")
+                        print(" -> 탐지 실패: 서버에서 예측 데이터가 오지 않았습니다.")
                         current_state = STATE_RESULT_ERROR
                         error_reason = "NO_OBJECT"
 
                 except requests.exceptions.RequestException as e:
                     print(f" [API_ERROR] 서버 통신 실패: {e}")
-                    print(" -> 컨테이너 서버가 켜져 있는지 확인하세요 (docker ps)")
                     current_state = STATE_RESULT_ERROR
                     error_reason = "SYSTEM_FAULT"
 
@@ -444,7 +386,6 @@ def main():
             elif current_state == STATE_RESULT_SUCCESS:
                 if not result_displayed:
                     lcd.clear()
-                    # 모델에 학습된 스페인어 클래스 기반 분기 처리
                     if success_item_name == "plastico":
                         lcd.set_message("PLASTIC BOTTLE", lcd.LCD_LINE_1)
                         lcd.set_message("REMOVE CAP&LABEL", lcd.LCD_LINE_2)

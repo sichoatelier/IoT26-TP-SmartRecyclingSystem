@@ -306,51 +306,59 @@ def get_ultrasonic_distance():
 
 
 # ==========================================
-# 6. OpenCV 하이브리드 수집 엔진 (Picamera2 가속화 우선순위 통합)
+# 6. OpenCV 하이브리드 수집 엔진 (라즈베리파이 5 Kernel Panic 완전 회피 설계)
 # ==========================================
 def capture_single_frame(output_path):
     """
-    라즈베리파이 5 CSI 카메라 드라이버의 VIDIOC_STREAMON(errno=22) 제약을 완벽하게 우회하는 최강의 캡처 파이프라인입니다.
-    
-    1단계: Picamera2 API (라즈베리파이 5 공식 CSI 카메라 제어 유일 규격) 시도
-    2단계: 시스템 비디오 디바이스(/dev/video*) 동적 분석 및 V4L2 노드 순차 루프 스캔 (USB 웹캠 등 자동 연동)
+    라즈베리파이 5 환경에서 OpenCV가 커널에 해상도를 강제할 때 발생하는 errno=22 (Invalid argument) 오류를
+    영구적으로 제거하기 위해, 카메라 속성을 전혀 조작하지 않고 Native(원시) 상태에서 캡처 후 소프트웨어로 리사이징합니다.
     """
-    # --- 1단계: Native Picamera2 API 시도 (CSI 카메라 모듈 v1/v2/v3 대응) ---
+    # --- 1단계: Native Picamera2 API 시도 (가장 권장되는 방법) ---
     print("[CAM_DEBUG] [1단계] 라즈베리파이 5 공식 Picamera2 드라이버 마운트 시도...")
     picam = None
     try:
         from picamera2 import Picamera2
-        print("[CAM_DEBUG]   -> Picamera2 라이브러리 탑재 완료! 하드웨어 세팅 구성 중...")
-        
-        # Picamera2 인스턴스 생성 및 스틸 이미지 640x480 촬영 구조 적용
         picam = Picamera2()
         config = picam.create_still_configuration(main={"size": (640, 480)})
         picam.configure(config)
         picam.start()
-        
-        # 지정 디렉토리에 다이렉트 파일 인가
         picam.capture_file(output_path)
         picam.stop()
         picam.close()
         print("[CAM_DEBUG] [SUCCESS] Picamera2 커널을 통한 스틸 이미지 캡처 완료.")
         
-        # 원본 이미지 후처리 (180도 회전 및 레터박스 연산)
         saved_frame = cv2.imread(output_path)
         if saved_frame is not None:
             return process_and_save_frame(saved_frame, output_path)
-            
     except ImportError:
-        print("[CAM_DEBUG]   -> 컨테이너 파이썬 환경에 Picamera2가 없습니다. 디바이스 노드 전수 스캔으로 선회합니다.")
+        print("[CAM_DEBUG]   -> 컨테이너에 Picamera2 모듈이 설치되어 있지 않습니다.")
     except Exception as e:
-        print(f"[CAM_DEBUG]   -> Picamera2 가동 실패 (하드웨어 미연결 혹은 사용 중): {e}")
+        print(f"[CAM_DEBUG]   -> Picamera2 가동 실패: {e}")
         try:
-            if picam is not None:
-                picam.close()
-        except:
-            pass
+            if picam is not None: picam.close()
+        except: pass
 
-    # --- 2단계: 시스템 비디오 디바이스(/dev/video*) 동적 분석 및 V4L2 순차 루프 스캔 ---
-    print("[CAM_DEBUG] [2단계] 사용 가능한 비디오 장치 노드 (/dev/video*) 동적 검색 개시...")
+    # --- 2단계: OS 레벨 CLI 캡처 툴 시도 (libcamera-apps) ---
+    print("[CAM_DEBUG] [2단계] 시스템 rpicam-still / libcamera-still 프로세스 실행 시도...")
+    commands = [
+        ["rpicam-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "-o", output_path],
+        ["libcamera-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "-o", output_path]
+    ]
+    
+    for cmd in commands:
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5.0)
+            if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                print("[CAM_DEBUG] [SUCCESS] CLI 유틸리티를 통한 영구 저장 데이터 획득 성공!")
+                saved_frame = cv2.imread(output_path)
+                if saved_frame is not None:
+                    return process_and_save_frame(saved_frame, output_path)
+        except Exception:
+            pass  # 실행 파일이 없는 경우 조용히 다음 단계로 넘어감
+    print("[CAM_DEBUG]   -> 시스템 레벨 카메라 유틸리티가 존재하지 않습니다. (Docker 환경 특성)")
+
+    # --- 3단계: 절대 안전 V4L2 다이렉트 캡처 (근본 원인 제거형) ---
+    print("[CAM_DEBUG] [3단계] V4L2 속성 강제 변경을 배제한 절대 안전 순수 캡처 진행...")
     
     video_devices = []
     try:
@@ -359,49 +367,43 @@ def capture_single_frame(output_path):
                 try:
                     num = int(dev.replace('video', ''))
                     video_devices.append(num)
-                except ValueError:
-                    pass
+                except ValueError: pass
         video_devices.sort()
-    except Exception as e:
-        print(f"[CAM_DEBUG]   -> /dev 디렉토리 스캔 오류: {e}")
-        video_devices = [0, 1, 2, 3, 4]  # 스캔 실패 시 폴백 장치 기본 범위
+    except Exception:
+        video_devices = [0, 1]
 
-    print(f"[CAM_DEBUG]   -> 감지된 시스템 비디오 노드 리스트: {video_devices}")
-
-    # 사용 가능한 모든 비디오 장치를 완전 루프 탐색
     for dev_idx in video_devices:
-        print(f"[CAM_DEBUG]   -> 디바이스 /dev/video{dev_idx} 활성화 및 바인딩 테스트 중...")
+        print(f"[CAM_DEBUG]   -> 디바이스 /dev/video{dev_idx} 활성화 (cap.set 해상도 강제 지정 완전 배제)...")
         cap = None
         try:
+            # V4L2 백엔드를 명시하지만, 버퍼 크기나 해상도 등을 일절 cap.set() 하지 않습니다.
+            # 라즈베리파이 5의 /dev/video0는 해상도를 건드리는 순간 STREAMON 에러(errno 22)를 내뿜기 때문입니다.
             cap = cv2.VideoCapture(dev_idx, cv2.CAP_V4L2)
             if not cap.isOpened():
-                print(f"[CAM_DEBUG]      -> /dev/video{dev_idx} 오픈 실패 (타 프로세스 점유 혹은 무반응)")
+                print(f"[CAM_DEBUG]      -> /dev/video{dev_idx} 장치를 열 수 없습니다.")
                 continue
 
-            # 해상도를 기본 표준 비율(640x480)로 타협하여 적용
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            # 카메라 웜업 지연 (노출 자동 조절을 위해 충분한 시간 제공)
+            time.sleep(0.8)
             
-            # 카메라 웜업 지연
-            time.sleep(0.5)
-            
-            # 물리적 동기화 프레임 감지 루프 (최대 10회)
+            # 물리적 동기화 프레임 감지 루프
             frame_grabbed = False
-            for i in range(10):
+            for i in range(15):
                 if cap.grab():
                     frame_grabbed = True
                     break
-                time.sleep(0.05)
+                time.sleep(0.1) # 버퍼가 쌓일 시간을 넉넉히 인가
             
             if frame_grabbed:
                 ret, frame = cap.retrieve()
                 if ret and frame is not None:
-                    print(f"[CAM_DEBUG] [SUCCESS] /dev/video{dev_idx}에서 온전한 프레임 데이터 취득 성공!")
+                    print(f"[CAM_DEBUG] [SUCCESS] /dev/video{dev_idx}에서 Native 원시 프레임({frame.shape}) 획득 성공!")
+                    # 원시 프레임을 소프트웨어 레벨에서 640x640으로 가공 (커널 충돌 완벽 우회)
                     success = process_and_save_frame(frame, output_path)
                     cap.release()
                     return success
             else:
-                print(f"[CAM_DEBUG]      -> /dev/video{dev_idx} 장치에서 유효한 프레임 동기화 신호가 없습니다.")
+                print(f"[CAM_DEBUG]      -> /dev/video{dev_idx} 장치에서 프레임을 Grab 하지 못했습니다.")
                 
             cap.release()
         except Exception as e:
@@ -410,13 +412,14 @@ def capture_single_frame(output_path):
                 cap.release()
 
     print("[CAM_DEBUG] [FATAL] 모든 하이브리드 제어 파이프라인에서 이미지를 가져오지 못했습니다.")
+    print("         -> 만약 컨테이너 환경이라면 호스트에서 컨테이너로 /dev/video* 장치 권한이 올바르게 할당되었는지 확인해주세요.")
     return False
 
 
 def process_and_save_frame(frame, output_path):
     """
     수집된 프레임을 스마트 분리수거 방향(180도)에 매핑하고 
-    YOLOv8 고화소 정사각(640x640) 레터박스 이미지로 연산 및 저장하는 함수입니다.
+    YOLOv8 고화소 정사각(640x640) 레터박스 이미지로 소프트웨어 연산 처리하여 저장합니다.
     """
     try:
         # 카메라 상하 반전 보정 (180도 회전)

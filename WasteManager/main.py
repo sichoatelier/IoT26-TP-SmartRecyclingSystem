@@ -3,49 +3,48 @@ import sys
 import time
 import subprocess
 from datetime import datetime
+import requests  # 서버와 HTTP 통신을 위한 라이브러리 (추가됨)
 import gpiod
-from gpiod.line import Direction, Value  # gpiod v2.x의 표준 방향 및 값 정의 임포트
+from gpiod.line import Direction, Value
 from smbus2 import SMBus
-import cv2  # 컨테이너 환경에서 안정적이고 가벼운 OpenCV 임포트
-from ultralytics import YOLO  # YOLOv8 추론 및 NCNN 가속화를 위한 라이브러리
+import cv2
 
 # ==========================================
 # 1. 시스템 상태 기계 (State Machine) 상태 정의
 # ==========================================
-STATE_IDLE = "IDLE"              # 대기 및 온습도 모니터링 상태 (사용자 배출 대기)
-STATE_SCANNING = "SCANNING"      # 초음파 트리거 감지 후 카메라 촬영 및 YOLO 추론 상태
-STATE_RESULT_SUCCESS = "SUCCESS"  # 탐지 성공 및 분류 가이드 제공 상태
-STATE_RESULT_ERROR = "ERROR"      # 탐지 실패 (객체 없음, 신뢰도 미달, HW 오류) 상태
+STATE_IDLE = "IDLE"              
+STATE_SCANNING = "SCANNING"      
+STATE_RESULT_SUCCESS = "SUCCESS"  
+STATE_RESULT_ERROR = "ERROR"      
 
 # ==========================================
-# 2. 시스템 하드웨어 핀 및 설정 정의
+# 2. 시스템 하드웨어 및 서버 API 설정
 # ==========================================
-CHIP_PATH = '/dev/gpiochip4'  # 라즈베리파이 5 기본 GPIO 디바이스 절대 경로
+CHIP_PATH = '/dev/gpiochip4'  
 
-# 초음파 센서 (HC-SR04) 핀 - 사용자 트리거용
-TRIG_PIN = 23  # GPIO 23 (Pin 16)
-ECHO_PIN = 24  # GPIO 24 (Pin 18)
+# 센서 핀 설정
+TRIG_PIN = 23  
+ECHO_PIN = 24  
+DHT_PIN = 17   
 
-# 온습도 센서 (DHT11) 핀 - 내부 위생 상태 주기 감시용
-DHT_PIN = 17   # GPIO 17 (Pin 11)
-
-# I2C LCD 주소 및 버스 번호
-LCD_ADDRESS = 0x27  # i2cdetect 결과에 따라 0x3F 등으로 변경 가능
+# I2C LCD 설정
+LCD_ADDRESS = 0x27  
 I2C_BUS = 1
 
-# 파일 및 AI 모델 저장 경로 설정
+# 파일 경로 및 서버 통신 설정
 SAVE_DIR = "/opt/Desktop"
 if not os.path.exists(SAVE_DIR):
-    SAVE_DIR = os.getcwd()  # 경로가 없으면 현재 작업 폴더에 저장
+    SAVE_DIR = os.getcwd()  
 
-PT_MODEL_PATH = "best.pt"            # 베이스 PyTorch 가중치 모델
-NCNN_MODEL_DIR = "best_ncnn_model"  # 초고속 NCNN 가속화 컴파일 모델 디렉토리
 TEMP_IMAGE_PATH = os.path.join(SAVE_DIR, "captured_waste.jpg")
+
+# 컨테이너에 띄워둔 FastAPI 서버 주소 (호스트 포트 8000 기준)
+API_URL = "http://localhost:8000/predict"
 
 CONFIDENCE_THRESHOLD = 0.5  # 인공지능 분석 신뢰도 커트라인 (50%)
 
 # ==========================================
-# 3. I2C 16x2 LCD 드라이버 클래스 (Marquee 스크롤링 지원)
+# 3. I2C 16x2 LCD 드라이버 클래스
 # ==========================================
 class I2CLCD:
     def __init__(self, address=0x27, bus_num=1):
@@ -57,14 +56,13 @@ class I2CLCD:
             self.bus = None
             return
             
-        self.LCD_CHR = 1  # 데이터 모드
-        self.LCD_CMD = 0  # 명령 모드
-        self.LCD_LINE_1 = 0x80  # 첫 번째 줄 시작
-        self.LCD_LINE_2 = 0xC0  # 두 번째 줄 시작
-        self.LCD_BACKLIGHT = 0x08  # 백라이트 켜기
-        self.ENABLE = 0b00000100  # Enable 신호 펄스
+        self.LCD_CHR = 1  
+        self.LCD_CMD = 0  
+        self.LCD_LINE_1 = 0x80  
+        self.LCD_LINE_2 = 0xC0  
+        self.LCD_BACKLIGHT = 0x08  
+        self.ENABLE = 0b00000100  
         
-        # 스크롤링 제어 변수
         self.line1_text = ""
         self.line2_text = ""
         self.line1_scroll = False
@@ -73,7 +71,6 @@ class I2CLCD:
         self.line2_idx = 0
         self.last_scroll_time = 0.0
         
-        # LCD 초기화 시퀀스
         self.lcd_write(0x33, self.LCD_CMD)
         self.lcd_write(0x32, self.LCD_CMD)
         self.lcd_write(0x06, self.LCD_CMD)
@@ -102,9 +99,8 @@ class I2CLCD:
         self.send_pulse(low)
 
     def set_message(self, text, line):
-        """메시지를 설정하고, 16자 초과 시 스크롤링 플래그를 비동기 활성화합니다."""
         if len(text) > 16:
-            scroll_text = text + "    "  # 회전 시 여백 추가
+            scroll_text = text + "    "  
             scroll = True
         else:
             scroll_text = text.ljust(16, " ")
@@ -124,7 +120,6 @@ class I2CLCD:
                 self.display_text_direct(scroll_text, line)
 
     def display_text_direct(self, text, line):
-        """LCD 라인에 아스키 문자들을 직접 출력합니다."""
         if not self.bus:
             return
         self.lcd_write(line, self.LCD_CMD)
@@ -132,9 +127,7 @@ class I2CLCD:
             self.lcd_write(ord(char), self.LCD_CHR)
 
     def update_scroll(self):
-        """메인 비차단 루프 내에서 호출되어 텍스트를 흘려보내는 마퀴 기능을 틱 연산합니다."""
         curr = time.time()
-        # 0.35초 마다 한 글자씩 왼쪽으로 스크롤 이동
         if curr - self.last_scroll_time < 0.35:
             return
         self.last_scroll_time = curr
@@ -161,103 +154,71 @@ class I2CLCD:
         self.lcd_write(0x01, self.LCD_CMD)
         time.sleep(0.005)
 
-
 # ==========================================
-# 4. 온습도 센서 (DHT11) 나노초 정밀 수집 함수
+# 4. 온습도 센서 (DHT11) 함수 (기존과 동일)
 # ==========================================
 def read_dht11_detailed():
-    """도커 컨테이너 지연을 극복하기 위해 나노초 단위 절대 시간 변동 측정을 수행합니다."""
     timestamps = []
     values = []
-    
     try:
         with gpiod.request_lines(
             CHIP_PATH,
             consumer="DHT11",
-            config={
-                DHT_PIN: gpiod.LineSettings(
-                    direction=gpiod.line.Direction.OUTPUT, 
-                    output_value=gpiod.line.Value.ACTIVE
-                )
-            }
+            config={DHT_PIN: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT, output_value=gpiod.line.Value.ACTIVE)}
         ) as lines:
-            
-            # 시작 신호 인가
             lines.set_value(DHT_PIN, gpiod.line.Value.INACTIVE)
             time.sleep(0.018)
             lines.set_value(DHT_PIN, gpiod.line.Value.ACTIVE)
             time.sleep(0.00004)
+            lines.reconfigure_lines(config={DHT_PIN: gpiod.LineSettings(direction=gpiod.line.Direction.INPUT)})
             
-            # 고속 동적 입력 모드 전환
-            lines.reconfigure_lines(
-                config={
-                    DHT_PIN: gpiod.LineSettings(direction=gpiod.line.Direction.INPUT)
-                }
-            )
-            
-            # 절대 나노초 변동 수집 루프
             get_val = lines.get_value
             pin = DHT_PIN
-            
             last_val = get_val(pin).value
             timestamps.append(time.perf_counter_ns())
             values.append(last_val)
             
-            timeout_ns = time.perf_counter_ns() + 100000000  # 100ms 타임아웃
+            timeout_ns = time.perf_counter_ns() + 100000000  
             while time.perf_counter_ns() < timeout_ns:
                 curr_val = get_val(pin).value
                 if curr_val != last_val:
                     timestamps.append(time.perf_counter_ns())
                     values.append(curr_val)
                     last_val = curr_val
-                    if len(values) > 100:
-                        break
+                    if len(values) > 100: break
     except Exception as e:
         return None, None, f"GPIO 접근 실패 ({str(e)})"
                 
-    if len(values) < 10:
-        return None, None, "센서 무반응 (연결 확인 요망)"
+    if len(values) < 10: return None, None, "센서 무반응"
         
-    # HIGH 상태 유지 시간(us) 계산
     high_durations = []
     for i in range(len(values) - 1):
         if values[i] == 1:
-            duration_us = (timestamps[i+1] - timestamps[i]) / 1000.0
-            high_durations.append(duration_us)
+            high_durations.append((timestamps[i+1] - timestamps[i]) / 1000.0)
             
-    if len(high_durations) < 40:
-        return None, None, f"데이터 패킷 부족 (HIGH 구간: {len(high_durations)}개)"
+    if len(high_durations) < 40: return None, None, "데이터 부족"
         
     bit_signals = high_durations[-40:]
     avg_len = sum(bit_signals) / 40.0
     
-    # 40비트 복원
     data_bytes = [0, 0, 0, 0, 0]
     for i in range(40):
         byte_idx = i // 8
         data_bytes[byte_idx] <<= 1
-        if bit_signals[i] > avg_len:
-            data_bytes[byte_idx] |= 1
+        if bit_signals[i] > avg_len: data_bytes[byte_idx] |= 1
             
-    # 체크섬 검증
     checksum = (data_bytes[0] + data_bytes[1] + data_bytes[2] + data_bytes[3]) & 0xFF
     if data_bytes[4] == checksum:
         humidity = data_bytes[0] + (data_bytes[1] * 0.1)
         temperature = data_bytes[2] + (data_bytes[3] * 0.1)
-        if humidity > 100.0 or temperature > 80.0:
-            return None, None, "센서 오독 (이상 임계값 감지)"
+        if humidity > 100.0 or temperature > 80.0: return None, None, "오독"
         return round(temperature, 1), round(humidity, 1), "SUCCESS"
-    else:
-        return None, None, "체크섬 불일치 (데이터 깨짐)"
-
+    else: return None, None, "체크섬 불일치"
 
 # ==========================================
-# 5. 검증된 초음파 센서 (HC-SR04) 거리 측정 함수
+# 5. 초음파 센서 (HC-SR04) 함수 (기존과 동일)
 # ==========================================
 def get_ultrasonic_distance():
-    """
-    gpiod v2.x request_lines 방식을 기반으로 초음파 센서로부터 거리를 계산하여 cm 단위로 반환합니다.
-    """
     try:
         with gpiod.request_lines(
             CHIP_PATH,
@@ -267,55 +228,35 @@ def get_ultrasonic_distance():
                 ECHO_PIN: gpiod.LineSettings(direction=Direction.INPUT)
             }
         ) as lines:
-            
-            # 1. Trigger 핀을 Low(0)로 잠시 안정화
             lines.set_value(TRIG_PIN, Value.INACTIVE)
-            time.sleep(0.05)  # 50ms 대기 (통합 대기 지연 최적화)
-            
-            # 2. Trigger 핀에 10us of High(1) 펄스 인가
+            time.sleep(0.05)  
             lines.set_value(TRIG_PIN, Value.ACTIVE)
             time.sleep(0.00001)
             lines.set_value(TRIG_PIN, Value.INACTIVE)
             
-            # 3. Echo 핀이 High가 되는 시간 측정
             start_time = time.time()
-            timeout = start_time + 1.0  # 1초 타임아웃
-            
+            timeout = start_time + 1.0  
             while lines.get_value(ECHO_PIN) == Value.INACTIVE:
                 start_time = time.time()
-                if start_time > timeout:
-                    return -1.0
+                if start_time > timeout: return -1.0
                     
-            # 4. Echo 핀이 Low가 되는 시간 측정
             stop_time = time.time()
             timeout = stop_time + 1.0
             while lines.get_value(ECHO_PIN) == Value.ACTIVE:
                 stop_time = time.time()
-                if stop_time > timeout:
-                    return -1.0
+                if stop_time > timeout: return -1.0
                     
-            # 5. 왕복 시간 계산 및 거리 환산 (단위: cm)
-            duration = stop_time - start_time
-            distance = duration * 17150
-            
-            return round(distance, 1)
-            
+            return round((stop_time - start_time) * 17150, 1)
     except Exception as e:
-        print(f"초음파 센서 제어 에러: {e}")
+        print(f"초음파 제어 에러: {e}")
         return -1.0
 
-
 # ==========================================
-# 6. OpenCV 하이브리드 수집 엔진 (라즈베리파이 5 Kernel Panic 완전 회피 설계)
+# 6. 카메라 제어 (호스트 직접 제어 - 동일하게 유지)
 # ==========================================
 def capture_single_frame(output_path):
-    """
-    라즈베리파이 5 환경에서 OpenCV가 커널에 해상도를 강제할 때 발생하는 errno=22 (Invalid argument) 오류를
-    영구적으로 제거하기 위해, 카메라 속성을 전혀 조작하지 않고 Native(원시) 상태에서 캡처 후 소프트웨어로 리사이징합니다.
-    """
-    # --- 1단계: Native Picamera2 API 시도 (가장 권장되는 방법) ---
-    print("[CAM_DEBUG] [1단계] 라즈베리파이 5 공식 Picamera2 드라이버 마운트 시도...")
-    picam = None
+    print("[CAM_DEBUG] 호스트 카메라 제어를 시작합니다...")
+    # 1. Picamera2 시도
     try:
         from picamera2 import Picamera2
         picam = Picamera2()
@@ -325,348 +266,211 @@ def capture_single_frame(output_path):
         picam.capture_file(output_path)
         picam.stop()
         picam.close()
-        print("[CAM_DEBUG] [SUCCESS] Picamera2 커널을 통한 스틸 이미지 캡처 완료.")
-        
         saved_frame = cv2.imread(output_path)
         if saved_frame is not None:
             return process_and_save_frame(saved_frame, output_path)
-    except ImportError:
-        print("[CAM_DEBUG]   -> 컨테이너에 Picamera2 모듈이 설치되어 있지 않습니다.")
-    except Exception as e:
-        print(f"[CAM_DEBUG]   -> Picamera2 가동 실패: {e}")
-        try:
-            if picam is not None: picam.close()
-        except: pass
+    except Exception: pass
 
-    # --- 2단계: OS 레벨 CLI 캡처 툴 시도 (libcamera-apps) ---
-    print("[CAM_DEBUG] [2단계] 시스템 rpicam-still / libcamera-still 프로세스 실행 시도...")
+    # 2. CLI 툴 시도
     commands = [
         ["rpicam-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "-o", output_path],
         ["libcamera-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "-o", output_path]
     ]
-    
     for cmd in commands:
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5.0)
-            if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                print("[CAM_DEBUG] [SUCCESS] CLI 유틸리티를 통한 영구 저장 데이터 획득 성공!")
+            if res.returncode == 0 and os.path.exists(output_path):
                 saved_frame = cv2.imread(output_path)
                 if saved_frame is not None:
                     return process_and_save_frame(saved_frame, output_path)
-        except Exception:
-            pass  # 실행 파일이 없는 경우 조용히 다음 단계로 넘어감
-    print("[CAM_DEBUG]   -> 시스템 레벨 카메라 유틸리티가 존재하지 않습니다. (Docker 환경 특성)")
+        except Exception: pass
 
-    # --- 3단계: 절대 안전 V4L2 다이렉트 캡처 (근본 원인 제거형) ---
-    print("[CAM_DEBUG] [3단계] V4L2 속성 강제 변경을 배제한 절대 안전 순수 캡처 진행...")
-    
-    video_devices = []
-    try:
-        for dev in os.listdir('/dev'):
-            if dev.startswith('video'):
-                try:
-                    num = int(dev.replace('video', ''))
-                    video_devices.append(num)
-                except ValueError: pass
-        video_devices.sort()
-    except Exception:
-        video_devices = [0, 1]
-
+    # 3. V4L2 다이렉트 (안전형)
+    video_devices = [0, 1]
     for dev_idx in video_devices:
-        print(f"[CAM_DEBUG]   -> 디바이스 /dev/video{dev_idx} 활성화 (cap.set 해상도 강제 지정 완전 배제)...")
         cap = None
         try:
-            # V4L2 백엔드를 명시하지만, 버퍼 크기나 해상도 등을 일절 cap.set() 하지 않습니다.
-            # 라즈베리파이 5의 /dev/video0는 해상도를 건드리는 순간 STREAMON 에러(errno 22)를 내뿜기 때문입니다.
             cap = cv2.VideoCapture(dev_idx, cv2.CAP_V4L2)
-            if not cap.isOpened():
-                print(f"[CAM_DEBUG]      -> /dev/video{dev_idx} 장치를 열 수 없습니다.")
-                continue
-
-            # 카메라 웜업 지연 (노출 자동 조절을 위해 충분한 시간 제공)
+            if not cap.isOpened(): continue
             time.sleep(0.8)
-            
-            # 물리적 동기화 프레임 감지 루프
             frame_grabbed = False
             for i in range(15):
                 if cap.grab():
                     frame_grabbed = True
                     break
-                time.sleep(0.1) # 버퍼가 쌓일 시간을 넉넉히 인가
-            
+                time.sleep(0.1)
             if frame_grabbed:
                 ret, frame = cap.retrieve()
                 if ret and frame is not None:
-                    print(f"[CAM_DEBUG] [SUCCESS] /dev/video{dev_idx}에서 Native 원시 프레임({frame.shape}) 획득 성공!")
-                    # 원시 프레임을 소프트웨어 레벨에서 640x640으로 가공 (커널 충돌 완벽 우회)
                     success = process_and_save_frame(frame, output_path)
                     cap.release()
                     return success
-            else:
-                print(f"[CAM_DEBUG]      -> /dev/video{dev_idx} 장치에서 프레임을 Grab 하지 못했습니다.")
-                
             cap.release()
-        except Exception as e:
-            print(f"[CAM_DEBUG]      -> /dev/video{dev_idx} 작동 도중 예외: {e}")
-            if cap is not None:
-                cap.release()
+        except Exception:
+            if cap: cap.release()
 
-    print("[CAM_DEBUG] [FATAL] 모든 하이브리드 제어 파이프라인에서 이미지를 가져오지 못했습니다.")
-    print("         -> 만약 컨테이너 환경이라면 호스트에서 컨테이너로 /dev/video* 장치 권한이 올바르게 할당되었는지 확인해주세요.")
+    print("[CAM_DEBUG] [FATAL] 프레임 획득 실패.")
     return False
 
-
 def process_and_save_frame(frame, output_path):
-    """
-    수집된 프레임을 스마트 분리수거 방향(180도)에 매핑하고 
-    YOLOv8 고화소 정사각(640x640) 레터박스 이미지로 소프트웨어 연산 처리하여 저장합니다.
-    """
     try:
-        # 카메라 상하 반전 보정 (180도 회전)
         frame = cv2.rotate(frame, cv2.ROTATE_180)
-        
-        # YOLOv8 정방형(640x640) 종횡비 보존 레터박스(Letterboxing) 연산
+        # 네트워크 전송 속도 향상을 위해 640x640 고정 리사이즈 패딩
         h, w = frame.shape[:2]
         if h != 640 or w != 640:
             scale = 640.0 / max(h, w)
             resized_frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
-            
             final_square = cv2.copyMakeBorder(
                 resized_frame,
                 top=(640 - resized_frame.shape[0]) // 2,
                 bottom=640 - resized_frame.shape[0] - ((640 - resized_frame.shape[0]) // 2),
                 left=(640 - resized_frame.shape[1]) // 2,
                 right=640 - resized_frame.shape[1] - ((640 - resized_frame.shape[1]) // 2),
-                borderType=cv2.BORDER_CONSTANT,
-                value=[0, 0, 0]  # 블랙 사이드 패딩 처리
+                borderType=cv2.BORDER_CONSTANT, value=[0, 0, 0]
             )
             frame = final_square
             
-        write_ret = cv2.imwrite(output_path, frame)
-        if write_ret:
-            print(f"[CAM_DEBUG] [SUCCESS] 디스크 데이터 락 해제 및 파일 동기화 완료: {os.path.abspath(output_path)}")
-            return True
-        else:
-            print("[CAM_DEBUG] [ERROR] 로컬 파일 I/O 디스크 저장 실패.")
-            return False
+        cv2.imwrite(output_path, frame)
+        return True
     except Exception as e:
-        print(f"[CAM_DEBUG] [ERROR] 프레임 기하 전처리 연산 중 오류 발생: {e}")
+        print(f"[CAM_DEBUG] [ERROR] 이미지 처리 오류: {e}")
         return False
 
-
 # ==========================================
-# 7. AI 모델 라이프사이클 초기화 함수
-# ==========================================
-def initialize_ai_model():
-    """
-    NCNN 기반 가속 모델을 우선적으로 로드하고, 없을 경우 PT 모델을 컴파일하여 내보냅니다.
-    Explicitly define task="classify" to prevent task detection warnings.
-    """
-    print("AI 모델 초기화: 가중치 로드 시도 중...")
-    if os.path.exists(NCNN_MODEL_DIR):
-        print(f" -> NCNN 가속 모델 발견: '{NCNN_MODEL_DIR}' 디렉토리 로드 완료.")
-        return YOLO(NCNN_MODEL_DIR, task="classify")
-        
-    print(f" -> NCNN 모델을 찾을 수 없어 베이스 모델 '{PT_MODEL_PATH}'로 컴파일을 준비합니다.")
-    if not os.path.exists(PT_MODEL_PATH):
-        print(f" -> 로컬에 '{PT_MODEL_PATH}'가 존재하지 않습니다. 라이브 다운로드를 구성합니다.")
-        
-    try:
-        model = YOLO(PT_MODEL_PATH, task="classify")
-        print(" -> 라즈베리파이 5 엣지 맞춤형 NCNN 가속 포맷으로 변환 중... (수 분 소요)")
-        model.export(format="ncnn")
-        print(" -> NCNN 가속화 변환 성공!")
-        return YOLO(NCNN_MODEL_DIR, task="classify")
-    except Exception as e:
-        print(f"AI 모델 로드 실패: {e}")
-        return None
-
-
-# ==========================================
-# 8. 메인 통합 관제 및 상태 기계 구동 루프
+# 7. 메인 통합 관제 및 상태 기계 구동 루프
 # ==========================================
 def main():
     print("=" * 60)
-    print("AIoT 스마트 분리수거 시스템 - OpenCV V4L2 가속 포팅 및 비차단 마퀴 최적화")
+    print("AIoT 스마트 분리수거 시스템 - API 기반 모듈화 구조 적용")
     print("=" * 60)
     
-    # 8-1. LCD 하드웨어 초기화
     lcd = I2CLCD(address=LCD_ADDRESS, bus_num=I2C_BUS)
     lcd.set_message("  AIoT SYSTEM  ", lcd.LCD_LINE_1)
     lcd.set_message("   INITIAL...   ", lcd.LCD_LINE_2)
     time.sleep(1.0)
 
-    # 8-2. AI 가중치 모델 로드 (태스크 명시화)
-    yolo_model = initialize_ai_model()
-    if not yolo_model:
-        lcd.set_message("  AI MODEL ERR  ", lcd.LCD_LINE_2)
-        sys.exit(1)
-
-    # 기본 상태 설정
     current_state = STATE_IDLE
-    last_dht_time = 0      # 온습도 출력 제한용 타이머 (3초 주기)
-    
-    # 비차단(Non-blocking) 타이밍 제어용 전역 변수들
+    last_dht_time = 0      
     state_entry_time = 0
     result_displayed = False
     success_item_name = ""
     error_reason = ""
     
-    # 쓰레기를 먼저 배치한 후 센서에 접근하는 사용자 행동 유도 가이드 명시
     lcd.set_message("PLACE WASTE FIRST", lcd.LCD_LINE_1)
     lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
     print("\n상태 기계 구동 엔진 가동 중... [현재 상태: IDLE]")
-    print(" -> 시나리오 가이드: 쓰레기를 놓고 센서에 접근해 주세요.")
+    print(f" -> AI 모델 서버 주소: {API_URL}")
 
     try:
         while True:
             current_time = time.time()
-            
-            # 비차단 마퀴 스크롤 업데이트 (루프마다 지속적인 흘러가기 틱 관리)
             lcd.update_scroll()
             
-            # ==========================================
-            # [상태 1] STATE_IDLE: 대기 상태 제어 흐름
-            # ==========================================
+            # [상태 1] STATE_IDLE
             if current_state == STATE_IDLE:
-                # 3초 주기로 온습도를 정밀 감시하여 위생 환경을 감지 및 콘솔에 로깅 (텍스트 단순화)
                 if current_time - last_dht_time >= 3.0:
                     temp, hum, status = read_dht11_detailed()
-                    now_str = datetime.now().strftime('%H:%M:%S')
                     if status == "SUCCESS":
-                        print(f"[{now_str}] 내부 온도: {temp}°C | 내부 습도: {hum}%")
-                    else:
-                        print(f"[{now_str}] 온습도 감지 대기 중 (원인: {status})")
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] 내부 온도: {temp}°C | 습도: {hum}%")
                     last_dht_time = current_time
                 
-                # 초음파를 통해 쓰레기가 아닌 '사용자의 접근(손/몸)' 감지
                 dist = get_ultrasonic_distance()
                 if 0.0 < dist <= 7.0:
-                    print(f"\n[사용자 접근 감지] {dist}cm에 사용자 감지! 즉시 카메라 캡처를 실행합니다.")
+                    print(f"\n[트리거 작동] {dist}cm에 사용자 감지! 카메라 캡처를 실행합니다.")
                     current_state = STATE_SCANNING
 
-            # ==========================================
-            # [상태 2] STATE_SCANNING: 사용자 트리거로 즉각 촬영 및 AI 분석 (OpenCV 버전)
-            # ==========================================
+            # [상태 2] STATE_SCANNING: 촬영 및 API 서버 전송
             elif current_state == STATE_SCANNING:
                 lcd.clear()
                 lcd.set_message(" USER DETECTED! ", lcd.LCD_LINE_1)
                 lcd.set_message("  CAPTURING...  ", lcd.LCD_LINE_2)
                 
-                print(" -> 사용자 접근 조건 만족: 카메라 촬영 즉시 트리거 실행...")
-                
-                # OpenCV 동적 프레임 캡처 함수 호출 (도커 에러 해결법)
                 ret = capture_single_frame(TEMP_IMAGE_PATH)
                 if not ret:
-                    print(" [SYSTEM_ALERT] 카메라 하드웨어 장애 발생으로 이미지 프레임을 가져오지 못했습니다.")
+                    print(" [SYSTEM_ALERT] 카메라 이미지 프레임을 가져오지 못했습니다.")
                     current_state = STATE_RESULT_ERROR
                     error_reason = "SYSTEM_FAULT"
                     state_entry_time = time.time()
                     result_displayed = False
                     continue
                     
-                print(f" -> [캡처 성공] 임시 이미지 보관 완료: {TEMP_IMAGE_PATH}")
-                
-                # 캡처 직후 분석 안내 메시지 전환
                 lcd.clear()
-                lcd.set_message("  CAPTURED OK!  ", lcd.LCD_LINE_1)
+                lcd.set_message("  SENDING DATA  ", lcd.LCD_LINE_1)
                 lcd.set_message("  ANALYZING...  ", lcd.LCD_LINE_2)
                 
-                print(" -> YOLO NCNN 엣지 인공지능 패킷 분석 작동...")
+                print(f" -> 컨테이너 서버({API_URL})로 이미지 전송 중...")
                 try:
-                    results = yolo_model(TEMP_IMAGE_PATH, verbose=False)
-                    detected_item = None
-                    max_conf = 0.0
-                    
-                    if len(results) > 0:
-                        result = results[0]
+                    # 이미지 파일을 Multipart-Form 데이터로 서버에 전송
+                    with open(TEMP_IMAGE_PATH, "rb") as image_file:
+                        files = {"file": ("captured_waste.jpg", image_file, "image/jpeg")}
+                        response = requests.post(API_URL, files=files, timeout=10.0)
+                        response.raise_for_status() # 200번대 응답이 아닐 경우 예외 발생
                         
-                        # YOLO 이미지 분류(Classification) 모델인 경우 (result.probs 속성 존재)
-                        if hasattr(result, 'probs') and result.probs is not None:
-                            class_id = int(result.probs.top1)
-                            max_conf = float(result.probs.top1conf)
-                            detected_item = result.names[class_id].lower()
-                            
-                        # YOLO 객체 탐지(Detection) 모델인 경우 (result.boxes 속성 존재)
-                        elif hasattr(result, 'boxes') and result.boxes is not None and len(result.boxes) > 0:
-                            for box in result.boxes:
-                                conf = float(box.conf[0])
-                                if conf > max_conf:
-                                    max_conf = conf
-                                    class_id = int(box.cls[0])
-                                    detected_item = result.names[class_id].lower()
-                    
-                    if detected_item and max_conf >= CONFIDENCE_THRESHOLD:
-                        print(f" -> 탐지 성공: '{detected_item}' (신뢰도: {max_conf * 100:.1f}%)")
-                        current_state = STATE_RESULT_SUCCESS
-                        success_item_name = detected_item
-                        state_entry_time = time.time()
-                        result_displayed = False
-                    else:
-                        # 신뢰도 미달 혹은 객체 없음 분류
-                        if len(results) > 0 and (
-                            (hasattr(results[0], 'probs') and results[0].probs is not None) or 
-                            (hasattr(results[0], 'boxes') and results[0].boxes is not None and len(results[0].boxes) > 0)
-                        ):
-                            print(f" -> 탐지 실패: 물체를 감지했으나 신뢰도({max_conf * 100:.1f}%)가 기준선(50%) 미만입니다.")
+                    # JSON 결과 파싱
+                    api_result = response.json()
+                    predictions = api_result.get("predictions", [])
+                    server_time = api_result.get("processing_time_sec", 0)
+                    print(f" -> 서버 처리 완료 (응답시간: {server_time}초)")
+
+                    if predictions:
+                        # Classification 모델의 Top-1 결과 추출
+                        best_pred = predictions[0]
+                        detected_item = best_pred["class_name"]
+                        max_conf = best_pred["confidence"]
+                        
+                        if max_conf >= CONFIDENCE_THRESHOLD:
+                            print(f" -> 탐지 성공: '{detected_item}' (신뢰도: {max_conf * 100:.1f}%)")
+                            current_state = STATE_RESULT_SUCCESS
+                            success_item_name = detected_item
+                        else:
+                            print(f" -> 탐지 실패: 물체를 감지했으나 신뢰도({max_conf * 100:.1f}%)가 기준 미달입니다.")
                             current_state = STATE_RESULT_ERROR
                             error_reason = "LOW_CONFIDENCE"
-                        else:
-                            print(" -> 탐지 실패: 배출 영역 내에 쓰레기 데이터가 감지되지 않았습니다.")
-                            current_state = STATE_RESULT_ERROR
-                            error_reason = "NO_OBJECT"
-                        state_entry_time = time.time()
-                        result_displayed = False
-                            
-                except Exception as e:
-                    print(f" YOLO 인퍼런스 엔진 가동 중 심각한 예외 발생: {e}")
+                    else:
+                        print(" -> 탐지 실패: 서버에서 반환된 예측 데이터가 없습니다.")
+                        current_state = STATE_RESULT_ERROR
+                        error_reason = "NO_OBJECT"
+
+                except requests.exceptions.RequestException as e:
+                    print(f" [API_ERROR] 서버 통신 실패: {e}")
+                    print(" -> 컨테이너 서버가 켜져 있는지 확인하세요 (docker ps)")
                     current_state = STATE_RESULT_ERROR
                     error_reason = "SYSTEM_FAULT"
-                    state_entry_time = time.time()
-                    result_displayed = False
 
-            # ==========================================
-            # [상태 3] STATE_RESULT_SUCCESS: 탐지 성공 및 종류별 '올바른 전처리 가이드' 제공 (비차단형 구현)
-            # ==========================================
+                state_entry_time = time.time()
+                result_displayed = False
+
+            # [상태 3] STATE_RESULT_SUCCESS: 커스텀 클래스 가이드 제공
             elif current_state == STATE_RESULT_SUCCESS:
                 if not result_displayed:
                     lcd.clear()
-                    # 수거함은 단 하나이므로, "분리배출 요령(전처리 행동 명령)"을 동적으로 LCD에 적용
-                    if "bottle" in success_item_name or "plastic" in success_item_name:
+                    # 모델에 학습된 스페인어 클래스 기반 분기 처리
+                    if success_item_name == "plastico":
                         lcd.set_message("PLASTIC BOTTLE", lcd.LCD_LINE_1)
                         lcd.set_message("REMOVE CAP&LABEL", lcd.LCD_LINE_2)
                         print("가이드: [플라스틱] 비닐 라벨과 플라스틱 뚜껑을 완전히 떼어내고 압착하세요.")
-                    elif "can" in success_item_name or "metal" in success_item_name:
+                    elif success_item_name == "metal":
                         lcd.set_message("CAN & METAL WST", lcd.LCD_LINE_1)
                         lcd.set_message("EMPTY & FLATTEN", lcd.LCD_LINE_2)
                         print("가이드: [캔/메탈] 내부 잔여물을 깨끗이 비우고 찌그러뜨리세요.")
-                    elif "paper" in success_item_name or "cardboard" in success_item_name:
+                    elif success_item_name == "papel_y_carton":
                         lcd.set_message("PAPER / BOX WST", lcd.LCD_LINE_1)
                         lcd.set_message("REMOVE TAPE&FOLD", lcd.LCD_LINE_2)
-                        print("가이드: [종이류] 박스의 비닐 테이프와 이물질을 완전히 뜯고 평평하게 접으세요.")
-                    elif "glass" in success_item_name:
+                        print("가이드: [종이/박스류] 비닐 테이프와 이물질을 뜯고 평평하게 접으세요.")
+                    elif success_item_name == "vidrio":
                         lcd.set_message("GLASS BOTTLE", lcd.LCD_LINE_1)
                         lcd.set_message("RINSE WITH WATER", lcd.LCD_LINE_2)
-                        print("가이드: [유리병] 내용물을 가볍게 헹군 뒤 깨지지 않도록 부드럽게 배출하세요.")
+                        print("가이드: [유리병] 내용물을 헹군 뒤 깨지지 않게 주의하여 배출하세요.")
+                    elif success_item_name == "organico":
+                        lcd.set_message("ORGANIC WASTE", lcd.LCD_LINE_1)
+                        lcd.set_message("DRAIN WATER OUT", lcd.LCD_LINE_2)
+                        print("가이드: [음식물/유기물] 물기를 완전히 제거한 후 전용 수거함에 버리세요.")
                     else:
                         lcd.set_message("GENERAL TRASH", lcd.LCD_LINE_1)
                         lcd.set_message("STANDARD DISPOSE", lcd.LCD_LINE_2)
-                        print("가이드: [일반/기타] 별도 재활용이 곤란한 재질이므로 그대로 배출하세요.")
-                    
-                    print(" -> 시스템 배출 가이드 제공 시작 (비차단식 5초 버퍼 가동)")
+                        
                     result_displayed = True
 
-                # 전시 중에도 온습도 센서 지속 로깅
-                if current_time - last_dht_time >= 3.0:
-                    temp, hum, status = read_dht11_detailed()
-                    now_str = datetime.now().strftime('%H:%M:%S')
-                    if status == "SUCCESS":
-                        print(f"[{now_str}] 내부 온도: {temp}°C | 내부 습도: {hum}%")
-                    else:
-                        print(f"[{now_str}] 온습도 감지 대기 중 (원인: {status})")
-                    last_dht_time = current_time
-
-                # 비차단 타임 계산: 5초가 경과하면 안전하게 IDLE로 복구
                 if current_time - state_entry_time >= 5.0:
                     lcd.clear()
                     lcd.set_message("PLACE WASTE FIRST", lcd.LCD_LINE_1)
@@ -674,52 +478,32 @@ def main():
                     print(" -> 시스템 상태 복원 완료. [현재 상태: IDLE]\n")
                     current_state = STATE_IDLE
 
-            # ==========================================
-            # [상태 4] STATE_RESULT_ERROR: 탐지 실패 사유별 세부 제어 흐름 (비차단형 구현)
-            # ==========================================
+            # [상태 4] STATE_RESULT_ERROR
             elif current_state == STATE_RESULT_ERROR:
                 if not result_displayed:
                     lcd.clear()
-                    # 에러 원인에 따른 차별화 메시지 출력 구현
                     if error_reason == "NO_OBJECT":
                         lcd.set_message("DETECTION ERROR", lcd.LCD_LINE_1)
                         lcd.set_message("TRY AGAIN (EMPTY)", lcd.LCD_LINE_2)
-                        print("시스템 피드백: 촬영본에 물체가 정상적으로 식별되지 않습니다. 쓰레기가 올바르게 배치되었는지 점검하세요.")
                     elif error_reason == "LOW_CONFIDENCE":
                         lcd.set_message("DETECTION ERROR", lcd.LCD_LINE_1)
                         lcd.set_message("UNRECOGNIZED WT", lcd.LCD_LINE_2)
-                        print("시스템 피드백: 쓰레기 분리 배출 종류 식별의 불확실성이 큽니다. 다시 시도하세요.")
                     elif error_reason == "SYSTEM_FAULT":
                         lcd.set_message("  SYSTEM ERROR  ", lcd.LCD_LINE_1)
-                        lcd.set_message("CHECK CAMERA/HW", lcd.LCD_LINE_2)
-                        print("시스템 경고: 하드웨어 모듈 및 I/O 핀 결선 장애 혹은 카메라 접근 에러 발생. 콘솔 디버그 로그를 참고하여 연결을 진단하세요.")
+                        lcd.set_message("CHECK SERVER/CAM", lcd.LCD_LINE_2)
                     
-                    print(" -> 에러 리포트 가이드 제공 시작 (비차단식 5초 버퍼 가동)")
                     result_displayed = True
 
-                # 전시 중에도 온습도 정밀 지속 로깅
-                if current_time - last_dht_time >= 3.0:
-                    temp, hum, status = read_dht11_detailed()
-                    now_str = datetime.now().strftime('%H:%M:%S')
-                    if status == "SUCCESS":
-                        print(f"[{now_str}] 내부 온도: {temp}°C | 내부 습도: {hum}%")
-                    else:
-                        print(f"[{now_str}] 온습도 감지 대기 중 (원인: {status})")
-                    last_dht_time = current_time
-
-                # 5초 경과 시 IDLE로 복구
                 if current_time - state_entry_time >= 5.0:
                     lcd.clear()
                     lcd.set_message("PLACE WASTE FIRST", lcd.LCD_LINE_1)
                     lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
-                    print(" -> 예외 복구 및 센서 대기 모드 진입. [현재 상태: IDLE]\n")
                     current_state = STATE_IDLE
 
-            # 루프 사이클 CPU 점유율 과다 차단용 마이크로 지연
             time.sleep(0.05)
 
     except KeyboardInterrupt:
-        print("\n사용자에 의해 시스템이 안전 종료됩니다. 모든 자원을 정상 해제합니다.")
+        print("\n사용자에 의해 시스템이 안전 종료됩니다.")
     finally:
         lcd.clear()
 

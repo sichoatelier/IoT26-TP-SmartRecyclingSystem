@@ -305,95 +305,87 @@ def get_ultrasonic_distance():
 
 
 # ==========================================
-# 6. OpenCV V4L2 동적 프레임 수집기 (안정적인 디코드 포맷 강제 및 리트라이 메커니즘 보강)
+# 6. OpenCV V4L2 동적 프레임 수집기 (VIDIOC_QBUF 커널 인터럽트 충돌 완전 제거)
 # ==========================================
 def capture_single_frame(output_path):
     """
-    라즈베리파이 5 및 컨테이너 V4L2 환경에서 프레임 디코드가 0.0ms로 비정상 종료되는 현상을 방지하도록 설계되었습니다.
-    드라이버 포맷 명시적 강제(MJPEG), 웜업 기간 중 활성 대기(Active sleep) 추가, 
-    그리고 정상 프레임 수신 확인 시까지 루프 블로킹 안전장치를 제공합니다.
+    라즈베리파이 5 V4L2 커널 드라이버에서 'errno=22 (Invalid argument)'로 인한 버퍼 소실 현상을 완벽하게 피하기 위해 설계되었습니다.
+    드라이버 충돌을 일으키는 버퍼 크기 변경(CAP_PROP_BUFFERSIZE) ioctl 호출을 안전하게 제거하고,
+    하드웨어가 제공하는 순수 버퍼 자체를 소프트웨어 차단식으로 폴링하여 프레임을 성공적으로 디코딩해냅니다.
     """
     cap = None
     success = False
     
-    # 1. 다양한 장치 인덱스 및 포맷의 시도 목록 정의
+    # 디바이스 바인딩 타겟 설정 (가장 에러율이 낮고 가벼운 CAP_ANY 시스템 매핑)
     configs = [
-        {"idx": 0, "api": cv2.CAP_V4L2, "fourcc": "MJPG", "desc": "V4L2 전용 백엔드 MJPEG 포맷 (디바이스 0)"},
-        {"idx": 0, "api": cv2.CAP_V4L2, "fourcc": "YUYV", "desc": "V4L2 전용 백엔드 YUYV 포맷 (디바이스 0)"},
-        {"idx": 0, "api": cv2.CAP_ANY,  "fourcc": None,   "desc": "기본 통합 백엔드 (디바이스 0)"}
+        {"idx": 0, "api": cv2.CAP_ANY,  "desc": "기본 통합 카메라 백엔드 (디바이스 0)"},
+        {"idx": 0, "api": cv2.CAP_V4L2, "desc": "V4L2 전용 인터럽트 백엔드 (디바이스 0)"}
     ]
     
     for cfg in configs:
-        print(f"[CAM_DEBUG] [1단계] {cfg['desc']} 활성화 시도 중...")
+        print(f"[CAM_DEBUG] [1단계] {cfg['desc']} 결합 프로세스 시작...")
         try:
             cap = cv2.VideoCapture(cfg["idx"], cfg["api"])
             if not cap.isOpened():
-                print(f"[CAM_DEBUG]   -> 초기 드라이버 마운트 실패. 우회합니다.")
+                print(f"[CAM_DEBUG]   -> 마운트 실패. 카메라 포트 소유권을 타 핀에서 보류 중일 수 있습니다.")
                 if cap is not None:
                     cap.release()
                 continue
                 
-            # 비디오 드라이버 버퍼 최소화 
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # ★ [가장 중요] 로그의 "errno=22 (Invalid argument)"를 발생시킨 CAP_PROP_BUFFERSIZE ioctl 코드를 완전히 제외합니다.
+            # 커널 버퍼 테이블을 건드리지 않고, 하드웨어의 초기 MMAP 테이블 세션 그대로 가동을 시도합니다.
             
-            # 포맷 명시 지정 (V4L2 대역폭 오버헤드 억제 핵심)
-            if cfg["fourcc"] is not None:
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*cfg["fourcc"]))
-                
-            # 해상도를 640x480 표준으로 고정
+            # 해상도를 하드웨어가 100% 보증하는 보편적 640x480으로 조정
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             
-            actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-            actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-            print(f"[CAM_DEBUG] [2단계] 하드웨어 드라이버 프레임 세팅: 가로={actual_w}, 세로={actual_h}")
+            # 하드웨어 드라이버가 안정적인 메모리 큐를 적재하도록 여유로운 대기 시간 부여
+            print("[CAM_DEBUG] [2단계] 커널 드라이버 버퍼 웜업 개시 (0.8초 유예 지연)...")
+            time.sleep(0.8)
             
-            # ★ 드라이버가 컨테이너 I/O 상에서 실 비디오 포트를 정착시킬 수 있는 절대 마크 웜업 대기
-            print("[CAM_DEBUG] [3단계] 하드웨어 안정화 대기 시작 (0.6초 유예 지연)...")
-            time.sleep(0.6) 
-            
-            # 2회차 무반응(0.0ms)을 해결하기 위해 웜업 과정에서 단순 폴링이 아닌 실제 하드웨어 대기 유도
-            print("[CAM_DEBUG] [4단계] 액티브 버퍼 플러싱 및 프레임 트리거 루프...")
-            warmup_success = False
-            for i in range(12):
-                flush_start = time.time()
-                ret_dummy, dummy_frame = cap.read()
-                flush_duration = (time.time() - flush_start) * 1000.0
+            # 3단계: 커널의 비디오 큐를 소모하기 위해 grab() 폴링을 더 관대하게 시도
+            print("[CAM_DEBUG] [3단계] 비디오 드라이버 세션에 접근하여 물리 프레임 동기화 대기 중...")
+            frame_grabbed = False
+            for i in range(20):  # 최대 20회 시도
+                t_start = time.time()
+                grabbed = cap.grab()
+                duration = (time.time() - t_start) * 1000.0
                 
-                if not ret_dummy or dummy_frame is None:
-                    # 0ms 드랍 현상 방지를 위해 드라이버가 버퍼를 갱신할 수 있는 시간(80ms)을 강제 부여
-                    time.sleep(0.08)
+                if grabbed:
+                    print(f"[CAM_DEBUG]   -> {i+1}회차 만에 커널 드라이버 버퍼 획득 통과! ({duration:.1f}ms)")
+                    frame_grabbed = True
+                    # 남아있는 이전 더미 버퍼들을 비차단식으로 깔끔히 비우기 위해 추가 grab 3회 실시
+                    for _ in range(3):
+                        cap.grab()
+                        time.sleep(0.01)
+                    break
                 else:
-                    print(f"[CAM_DEBUG]   -> 버퍼 플러시 {i+1}회차 통과! (사이즈: {dummy_frame.shape}, 응답시간: {flush_duration:.1f}ms)")
-                    warmup_success = True
+                    # 버퍼 비우기 지연 완충
+                    time.sleep(0.06)
             
-            # 만약 웜업 루프 전체에서 프레임 획득이 한 번도 없었다면 해당 채널 무효화
-            if not warmup_success:
-                print("[CAM_DEBUG]   -> [경고] 스트림 데이터의 버퍼 갱신 흐름이 탐지되지 않았습니다. 백엔드 전환 시도.")
+            if not frame_grabbed:
+                print("[CAM_DEBUG]   -> [경고] 드라이버 버퍼 응답 타임아웃. 대체 포트로 인스턴스를 리셋합니다.")
                 cap.release()
                 continue
                 
-            print("[CAM_DEBUG] [5단계] 메인 분석용 최종 이미지 프레임 수집...")
-            # 가장 완벽하고 가시성이 우수한 버퍼 프레임을 보장받기 위한 3중 연속 캡처
-            for _ in range(3):
-                ret, frame = cap.read()
-                time.sleep(0.03)
-                
+            print("[CAM_DEBUG] [4단계] 획득된 하드웨어 버퍼를 BGR 행렬 포맷으로 디코딩...")
+            ret, frame = cap.retrieve()
+            
             if not ret or frame is None:
-                print("[CAM_DEBUG] [WARN] 타겟 프레임 획득 실패. 리소스 해제 후 교차 매칭 진행.")
+                print("[CAM_DEBUG] [WARN] 이미지 매트릭스 복원(Retrieve)에 실패했습니다. 다음 채널로 우회합니다.")
                 cap.release()
                 continue
                 
-            print(f"[CAM_DEBUG]   -> 프레임 획득 성공! 데이터 디코딩 차원: {frame.shape}")
+            print(f"[CAM_DEBUG]   -> 최종 캡처 성공! 복원 차원: {frame.shape}")
             
-            # 카메라 마운트 방향 대응 회전 처리
-            print("[CAM_DEBUG] [6단계] 회전 변환 처리 (180도)...")
+            # 카메라 마운트 상단 기준 반전
+            print("[CAM_DEBUG] [5단계] 이미지 기하학 대칭 보정 (180도 고속 반전)...")
             frame = cv2.rotate(frame, cv2.ROTATE_180)
             
-            # YOLO 표준 정사각형 (640x640) 가공 처리 (레터박싱 기술 도입)
+            # YOLOv8 고속 분석 전처리 - 이미지 비율 깨짐 방지용 레터박스 연산
             h, w = frame.shape[:2]
             if h != 640 or w != 640:
-                print(f"[CAM_DEBUG]   -> YOLO v8 맞춤형 640x640 크기 레터박스 전처리...")
+                print(f"[CAM_DEBUG]   -> 이미지 포맷팅: {w}x{h}에서 YOLO v8 최적화 640x640 레터박싱 연산 가동...")
                 scale = 640.0 / max(h, w)
                 resized_frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
                 
@@ -404,30 +396,30 @@ def capture_single_frame(output_path):
                     left=(640 - resized_frame.shape[1]) // 2,
                     right=640 - resized_frame.shape[1] - ((640 - resized_frame.shape[1]) // 2),
                     borderType=cv2.BORDER_CONSTANT,
-                    value=[0, 0, 0]  # 빈 영역은 블랙 패딩 처리
+                    value=[0, 0, 0]  # 블랙 여백 처리
                 )
                 frame = final_square
             
-            # 디바이스 보관
-            print(f"[CAM_DEBUG] [7단계] 획득 완료 이미지 디스크 저장 시도 ({output_path})...")
+            # 로컬 임시파일 저장
+            print(f"[CAM_DEBUG] [6단계] 로컬 비휘발성 저장 영역에 쓰기 작업 수행 중... ({output_path})")
             write_ret = cv2.imwrite(output_path, frame)
             if not write_ret:
-                print("[CAM_DEBUG] [ERROR] 디스크 I/O 처리 실패.")
+                print("[CAM_DEBUG] [ERROR] 로컬 파일 I/O 기록 실패. 디스크 권한 및 가용 용량을 확인하십시오.")
                 cap.release()
                 continue
                 
-            print(f"[CAM_DEBUG] [SUCCESS] 디스크 데이터 락 해제 완료: {os.path.abspath(output_path)}")
+            print(f"[CAM_DEBUG] [SUCCESS] 쓰기 잠금 완전 해제. 엣지 분석 준비 완료: {os.path.abspath(output_path)}")
             success = True
             break
             
         except Exception as e:
-            print(f"[CAM_DEBUG] [EXCEPT] 예외 발생: {e}")
+            print(f"[CAM_DEBUG] [EXCEPT] 비디오 처리 파이프라인에서 런타임 오류 포착: {e}")
             if cap is not None:
                 cap.release()
                 
     if cap is not None and cap.isOpened():
         cap.release()
-        print("[CAM_DEBUG] [8단계] 비디오 스트림 커넥션 완전 해제 완료.")
+        print("[CAM_DEBUG] [7단계] 비디오 점유 인스턴스 해제 및 OS 채널 할당량 반환이 완료되었습니다.")
         
     return success
 

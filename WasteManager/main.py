@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import subprocess
 from datetime import datetime
 import gpiod
 from gpiod.line import Direction, Value  # gpiod v2.x의 표준 방향 및 값 정의 임포트
@@ -305,123 +306,136 @@ def get_ultrasonic_distance():
 
 
 # ==========================================
-# 6. OpenCV V4L2 동적 프레임 수집기 (VIDIOC_QBUF 커널 인터럽트 충돌 완전 제거)
+# 6. OpenCV GStreamer & Subprocess 통합 하이브리드 수집기
 # ==========================================
 def capture_single_frame(output_path):
     """
-    라즈베리파이 5 V4L2 커널 드라이버에서 'errno=22 (Invalid argument)'로 인한 버퍼 소실 현상을 완벽하게 피하기 위해 설계되었습니다.
-    드라이버 충돌을 일으키는 버퍼 크기 변경(CAP_PROP_BUFFERSIZE) ioctl 호출을 안전하게 제거하고,
-    하드웨어가 제공하는 순수 버퍼 자체를 소프트웨어 차단식으로 폴링하여 프레임을 성공적으로 디코딩해냅니다.
+    라즈베리파이 5 CSI 카메라 드라이버의 VIDIOC_STREAMON(errno=22) 오류를 극복하기 위해 설계된 강력한 4단계 캡처 엔진입니다.
+    - 1단계: libcamera 통합 GStreamer 플러그인 연동 (CSI 표준 가동)
+    - 2단계: 최후의 독립 유틸리티 (rpicam-still / libcamera-still) 우회 실행
+    - 3단계: 하드웨어 기본값 보존형 V4L2 다이렉트 캡처
     """
+    print("[CAM_DEBUG] [1단계] 라즈베리파이 5 전용 GStreamer libcamerasrc 파이프라인 개시...")
+    
+    # GStreamer 전용 libcamera 소스 스트림 구성
+    gst_pipeline = (
+        "libcamerasrc ! video/x-raw, width=640, height=480 ! "
+        "videoconvert ! appsink"
+    )
+    
     cap = None
     success = False
     
-    # 디바이스 바인딩 타겟 설정 (가장 에러율이 낮고 가벼운 CAP_ANY 시스템 매핑)
-    configs = [
-        {"idx": 0, "api": cv2.CAP_ANY,  "desc": "기본 통합 카메라 백엔드 (디바이스 0)"},
-        {"idx": 0, "api": cv2.CAP_V4L2, "desc": "V4L2 전용 인터럽트 백엔드 (디바이스 0)"}
+    try:
+        cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            print("[CAM_DEBUG]   -> GStreamer 연결 승인! 하드웨어 초기화 중...")
+            time.sleep(0.5)
+            # 프레임 플러싱
+            for _ in range(5):
+                cap.grab()
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                print(f"[CAM_DEBUG]   -> GStreamer 스트림 캡처 성공! (크기: {frame.shape})")
+                success = process_and_save_frame(frame, output_path)
+                cap.release()
+                return success
+            else:
+                print("[CAM_DEBUG]   -> GStreamer 데이터 디코드 오류. 2단계 폴백 전환.")
+            cap.release()
+    except Exception as e:
+        print(f"[CAM_DEBUG]   -> GStreamer 초기화 도중 예외: {e}. 2단계 폴백 전환.")
+        if cap is not None:
+            cap.release()
+
+    # 2단계: Raspberry Pi OS 공식 고성능 CLI 수집 명령어 실행 (rpicam-still / libcamera-still)
+    print("[CAM_DEBUG] [2단계] rpicam-still / libcamera-still 프로세스 다이렉트 실행 시도...")
+    commands = [
+        ["rpicam-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "-o", output_path],
+        ["libcamera-still", "-t", "500", "--immediate", "--width", "640", "--height", "480", "-o", output_path]
     ]
     
-    for cfg in configs:
-        print(f"[CAM_DEBUG] [1단계] {cfg['desc']} 결합 프로세스 시작...")
+    for cmd in commands:
         try:
-            cap = cv2.VideoCapture(cfg["idx"], cfg["api"])
-            if not cap.isOpened():
-                print(f"[CAM_DEBUG]   -> 마운트 실패. 카메라 포트 소유권을 타 핀에서 보류 중일 수 있습니다.")
-                if cap is not None:
-                    cap.release()
-                continue
+            print(f"[CAM_DEBUG]   -> 명령어 호출: {' '.join(cmd)}")
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5.0)
+            if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                print("[CAM_DEBUG] [SUCCESS] CLI 유틸리티를 통한 영구 저장 데이터 획득 성공!")
                 
-            # ★ [가장 중요] 로그의 "errno=22 (Invalid argument)"를 발생시킨 CAP_PROP_BUFFERSIZE ioctl 코드를 완전히 제외합니다.
-            # 커널 버퍼 테이블을 건드리지 않고, 하드웨어의 초기 MMAP 테이블 세션 그대로 가동을 시도합니다.
-            
-            # 해상도를 하드웨어가 100% 보증하는 보편적 640x480으로 조정
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            
-            # 하드웨어 드라이버가 안정적인 메모리 큐를 적재하도록 여유로운 대기 시간 부여
-            print("[CAM_DEBUG] [2단계] 커널 드라이버 버퍼 웜업 개시 (0.8초 유예 지연)...")
+                # 저장된 이미지 로드하여 180도 회전 및 YOLO 규격(640x640) 재보정 작업 수행
+                saved_frame = cv2.imread(output_path)
+                if saved_frame is not None:
+                    process_and_save_frame(saved_frame, output_path)
+                    return True
+        except Exception as err:
+            print(f"[CAM_DEBUG]   -> CLI 연동 과정 에러: {err}")
+
+    # 3단계: V4L2 Properties 수정 없는 순수 무압축 기본 캡처 시도 (드라이버 리셋 방지)
+    print("[CAM_DEBUG] [3단계] 기본 V4L2 Properties 강제 수정 우회 캡처 진행...")
+    try:
+        cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        if cap.isOpened():
+            # ★ 핵심: ioctl(VIDIOC_S_FMT) 충돌을 방지하기 위해 해상도나 버퍼 크기를 직접 수정(cap.set)하지 않습니다.
             time.sleep(0.8)
-            
-            # 3단계: 커널의 비디오 큐를 소모하기 위해 grab() 폴링을 더 관대하게 시도
-            print("[CAM_DEBUG] [3단계] 비디오 드라이버 세션에 접근하여 물리 프레임 동기화 대기 중...")
             frame_grabbed = False
-            for i in range(20):  # 최대 20회 시도
-                t_start = time.time()
-                grabbed = cap.grab()
-                duration = (time.time() - t_start) * 1000.0
-                
-                if grabbed:
-                    print(f"[CAM_DEBUG]   -> {i+1}회차 만에 커널 드라이버 버퍼 획득 통과! ({duration:.1f}ms)")
+            for i in range(10):
+                if cap.grab():
                     frame_grabbed = True
-                    # 남아있는 이전 더미 버퍼들을 비차단식으로 깔끔히 비우기 위해 추가 grab 3회 실시
-                    for _ in range(3):
-                        cap.grab()
-                        time.sleep(0.01)
                     break
-                else:
-                    # 버퍼 비우기 지연 완충
-                    time.sleep(0.06)
-            
-            if not frame_grabbed:
-                print("[CAM_DEBUG]   -> [경고] 드라이버 버퍼 응답 타임아웃. 대체 포트로 인스턴스를 리셋합니다.")
-                cap.release()
-                continue
+                time.sleep(0.05)
                 
-            print("[CAM_DEBUG] [4단계] 획득된 하드웨어 버퍼를 BGR 행렬 포맷으로 디코딩...")
-            ret, frame = cap.retrieve()
-            
-            if not ret or frame is None:
-                print("[CAM_DEBUG] [WARN] 이미지 매트릭스 복원(Retrieve)에 실패했습니다. 다음 채널로 우회합니다.")
-                cap.release()
-                continue
-                
-            print(f"[CAM_DEBUG]   -> 최종 캡처 성공! 복원 차원: {frame.shape}")
-            
-            # 카메라 마운트 상단 기준 반전
-            print("[CAM_DEBUG] [5단계] 이미지 기하학 대칭 보정 (180도 고속 반전)...")
-            frame = cv2.rotate(frame, cv2.ROTATE_180)
-            
-            # YOLOv8 고속 분석 전처리 - 이미지 비율 깨짐 방지용 레터박스 연산
-            h, w = frame.shape[:2]
-            if h != 640 or w != 640:
-                print(f"[CAM_DEBUG]   -> 이미지 포맷팅: {w}x{h}에서 YOLO v8 최적화 640x640 레터박싱 연산 가동...")
-                scale = 640.0 / max(h, w)
-                resized_frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
-                
-                final_square = cv2.copyMakeBorder(
-                    resized_frame,
-                    top=(640 - resized_frame.shape[0]) // 2,
-                    bottom=640 - resized_frame.shape[0] - ((640 - resized_frame.shape[0]) // 2),
-                    left=(640 - resized_frame.shape[1]) // 2,
-                    right=640 - resized_frame.shape[1] - ((640 - resized_frame.shape[1]) // 2),
-                    borderType=cv2.BORDER_CONSTANT,
-                    value=[0, 0, 0]  # 블랙 여백 처리
-                )
-                frame = final_square
-            
-            # 로컬 임시파일 저장
-            print(f"[CAM_DEBUG] [6단계] 로컬 비휘발성 저장 영역에 쓰기 작업 수행 중... ({output_path})")
-            write_ret = cv2.imwrite(output_path, frame)
-            if not write_ret:
-                print("[CAM_DEBUG] [ERROR] 로컬 파일 I/O 기록 실패. 디스크 권한 및 가용 용량을 확인하십시오.")
-                cap.release()
-                continue
-                
-            print(f"[CAM_DEBUG] [SUCCESS] 쓰기 잠금 완전 해제. 엣지 분석 준비 완료: {os.path.abspath(output_path)}")
-            success = True
-            break
-            
-        except Exception as e:
-            print(f"[CAM_DEBUG] [EXCEPT] 비디오 처리 파이프라인에서 런타임 오류 포착: {e}")
-            if cap is not None:
-                cap.release()
-                
-    if cap is not None and cap.isOpened():
-        cap.release()
-        print("[CAM_DEBUG] [7단계] 비디오 점유 인스턴스 해제 및 OS 채널 할당량 반환이 완료되었습니다.")
+            if frame_grabbed:
+                ret, frame = cap.retrieve()
+                if ret and frame is not None:
+                    print(f"[CAM_DEBUG]   -> V4L2 고정 우회형 프레임 로드 성공! (해상도: {frame.shape})")
+                    success = process_and_save_frame(frame, output_path)
+                    cap.release()
+                    return success
+            cap.release()
+    except Exception as e:
+        print(f"[CAM_DEBUG]   -> V4L2 우회 시도 중 에러: {e}")
+        if cap is not None:
+            cap.release()
+
+    return False
+
+
+def process_and_save_frame(frame, output_path):
+    """
+    수집된 프레임을 스마트 분리수거 방향(180도)에 매핑하고 
+    YOLOv8 고화소 정사각(640x640) 레터박스 이미지로 연산 및 저장하는 함수입니다.
+    """
+    try:
+        # 카메라 상하 반전 보정
+        frame = cv2.rotate(frame, cv2.ROTATE_180)
         
-    return success
+        # YOLOv8 정방형(640x640) 종횡비 보존 레터박스(Letterboxing) 연산
+        h, w = frame.shape[:2]
+        if h != 640 or w != 640:
+            scale = 640.0 / max(h, w)
+            resized_frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
+            
+            final_square = cv2.copyMakeBorder(
+                resized_frame,
+                top=(640 - resized_frame.shape[0]) // 2,
+                bottom=640 - resized_frame.shape[0] - ((640 - resized_frame.shape[0]) // 2),
+                left=(640 - resized_frame.shape[1]) // 2,
+                right=640 - resized_frame.shape[1] - ((640 - resized_frame.shape[1]) // 2),
+                borderType=cv2.BORDER_CONSTANT,
+                value=[0, 0, 0]  # 블랙 사이드 패딩 처리
+            )
+            frame = final_square
+            
+        write_ret = cv2.imwrite(output_path, frame)
+        if write_ret:
+            print(f"[CAM_DEBUG] [SUCCESS] 디스크 데이터 락 해제 및 파일 동기화 완료: {os.path.abspath(output_path)}")
+            return True
+        else:
+            print("[CAM_DEBUG] [ERROR] 로컬 파일 I/O 디스크 저장 실패.")
+            return False
+    except Exception as e:
+        print(f"[CAM_DEBUG] [ERROR] 프레임 기하 전처리 연산 중 오류 발생: {e}")
+        return False
 
 
 # ==========================================

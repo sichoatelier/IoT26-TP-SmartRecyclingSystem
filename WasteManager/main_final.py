@@ -48,6 +48,7 @@ ENTRY_SERVO_PIN = 19
 # I2C LCD 설정
 LCD_ADDRESS = 0x27  
 I2C_BUS = 1
+PIEZO_PIN = 12
 
 # 파일 경로 및 서버 통신 설정
 SAVE_DIR = "/opt/Desktop"
@@ -336,6 +337,62 @@ class ServoController:
         self.req.set_value(self.pin, Value.INACTIVE)
         self.req.release()
         debug_print("SERVO", "cleanup 완료")
+
+
+# ==========================================
+# Piezo Buzzer 컨트롤러
+# ==========================================
+class BuzzerController:
+    def __init__(self, chip_path, pin):
+        self.pin = pin
+        debug_print("BUZZER", f"초기화 시작: chip_path={chip_path}, pin={pin}")
+        try:
+            self.req = gpiod.request_lines(
+                chip_path,
+                consumer="Buzzer",
+                config={self.pin: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE)}
+            )
+            debug_print("BUZZER", "GPIO 라인 요청 성공")
+        except Exception as e:
+            debug_print("BUZZER", f"GPIO 라인 요청 실패: {e}")
+            raise
+
+    def beep(self, duration_s=0.2):
+        """단발 비프: duration_s 초 동안 활성화"""
+        try:
+            self.req.set_value(self.pin, Value.ACTIVE)
+            time.sleep(duration_s)
+            self.req.set_value(self.pin, Value.INACTIVE)
+        except Exception as e:
+            debug_print("BUZZER", f"beep 에러: {e}")
+
+    def pattern_success(self):
+        """성공: 띠디디 (3번, 각 300ms)"""
+        debug_print("BUZZER", "pattern_success 시작")
+        for _ in range(3):
+            self.beep(0.3)
+            time.sleep(0.05)
+        debug_print("BUZZER", "pattern_success 종료")
+
+    def pattern_error(self):
+        """실패: 삐비빅! 짧은 연속음"""
+        debug_print("BUZZER", "pattern_error 시작")
+        # 짧게 3회 (예: 카드 결제 실패음 느낌)
+        self.beep(0.08)
+        time.sleep(0.06)
+        self.beep(0.08)
+        time.sleep(0.06)
+        self.beep(0.12)
+        debug_print("BUZZER", "pattern_error 종료")
+
+    def cleanup(self):
+        debug_print("BUZZER", "cleanup 시작")
+        try:
+            self.req.set_value(self.pin, Value.INACTIVE)
+            self.req.release()
+        except Exception as e:
+            debug_print("BUZZER", f"cleanup 에러: {e}")
+        debug_print("BUZZER", "cleanup 완료")
 
 # ==========================================
 # 6. 온습도 센서 (DHT11) 함수 및 4단계 알고리즘 적재
@@ -947,6 +1004,7 @@ def main():
     led = LEDController(CHIP_PATH, LED_PIN_R, LED_PIN_Y, LED_PIN_G, RGB_PIN_R, RGB_PIN_G, RGB_PIN_B)
     servo = ServoController(CHIP_PATH, SERVO_PIN)
     entry_servo = ServoController(CHIP_PATH, ENTRY_SERVO_PIN)
+    buzzer = BuzzerController(CHIP_PATH, PIEZO_PIN)
     
     lcd.set_message("  AIoT SYSTEM  ", lcd.LCD_LINE_1)
     lcd.set_message("   INITIAL...   ", lcd.LCD_LINE_2)
@@ -992,6 +1050,11 @@ def main():
                 dist = get_ultrasonic_distance()
                 if 0.0 < dist <= 7.0:
                     print(f"\n[트리거 작동] {dist}cm에 사용자 감지! 카메라 캡처를 실행합니다.")
+                    debug_print("BUZZER", "트리거 감지: 짧은 비프 200ms")
+                    try:
+                        buzzer.beep(0.2)
+                    except Exception as _:
+                        pass
                     current_state = STATE_SCANNING
                     led.set_state(STATE_SCANNING) 
 
@@ -1105,6 +1168,10 @@ def main():
 
                     debug_print("ENTRY_SERVO", "분류 성공 감지로 입구 개방(180도)")
                     entry_servo.set_angle(180, duration=0.8)
+                    try:
+                        buzzer.pattern_success()
+                    except Exception:
+                        pass
                     
                     # 4단계: 쓰레기 분류 결과 및 모터 서보 구동 각도를 SQLite3 데이터베이스에 로깅
                     log_waste_event(success_item_name, target_angle)
@@ -1143,6 +1210,11 @@ def main():
                     elif error_reason == "SYSTEM_FAULT":
                         lcd.set_message("  SYSTEM ERROR  ", lcd.LCD_LINE_1)
                         lcd.set_message("CHECK SERVER/CAM", lcd.LCD_LINE_2)
+                    # 실패시 짧은 오류음 재생
+                    try:
+                        buzzer.pattern_error()
+                    except Exception:
+                        pass
                     
                     result_displayed = True
 
@@ -1162,6 +1234,10 @@ def main():
         led.cleanup()
         servo.cleanup()
         entry_servo.cleanup()
+        try:
+            buzzer.cleanup()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()

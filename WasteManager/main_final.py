@@ -264,7 +264,7 @@ class LEDController:
 
     def update(self):
         if self.state in [STATE_IDLE, STATE_SCANNING]:
-            if time.time() - self.last_toggle_time >= 0.5:
+            if time.time() - self.last_toggle_time >= 0.25:
                 self.yellow_on = not self.yellow_on
                 val = Value.ACTIVE if self.yellow_on else Value.INACTIVE
                 self.req.set_value(self.pin_y, val)
@@ -1103,14 +1103,16 @@ def main():
                         f"분류 결과 반영: success_item_name={success_item_name}, target_angle={target_angle}, state={current_state}"
                     )
 
+                    # 4단계: 쓰레기 분류 결과 및 모터 서보 구동 각도를 SQLite3 데이터베이스에 로깅
+                    log_waste_event(success_item_name, target_angle)
+
+                    # 입구를 열기 전에 아래 분류 판을 먼저 목표 각도로 기울임 (동작 시간 약 1초 소요)
+                    servo.set_angle(target_angle, duration=1.0)
+
+                    # 판 각도 조정이 끝난 뒤 입구 개방
                     debug_print("ENTRY_SERVO", "분류 성공 감지로 입구 개방(180도)")
                     entry_servo.set_angle(180, duration=0.8)
 
-                    # 4단계: 쓰레기 분류 결과 및 모터 서보 구동 각도를 SQLite3 데이터베이스에 로깅
-                    log_waste_event(success_item_name, target_angle)
-                    
-                    # 판 기울이기 (동작 시간 약 1초 소요)
-                    servo.set_angle(target_angle, duration=1.0)
                     result_displayed = True
 
                 # 상태 진입 후 5초 경과 시 다시 대기 상태로 복귀 (비차단)

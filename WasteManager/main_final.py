@@ -1050,9 +1050,9 @@ def main():
     current_state = STATE_IDLE
     led.set_state(STATE_IDLE) 
     
-    # 시스템 시작 시 서보모터를 기본 수평 각도(90도)로 맞춤
-    debug_print("SERVO", "시스템 시작 시 기본 위치(90도)로 이동")
-    servo.set_angle(90, duration=1.0)
+    # 시스템 시작 시 분류 서보를 초기 위치(0도)로, 입구를 닫는 0도로 맞춤
+    debug_print("SERVO", "시스템 시작 시 분류 서보 초기 위치(0도)로 이동")
+    servo.set_angle(0, duration=1.0)
     debug_print("ENTRY_SERVO", "시스템 시작 시 입구를 닫는 0도로 설정")
     entry_servo.set_angle(0, duration=1.0)
     
@@ -1175,10 +1175,10 @@ def main():
                     # 서보모터 각도 맵핑 라우팅 (총 4개 방향)
                     # ----------------------------------------------------
                     if success_item_name == "plastico":
-                        target_angle = 35
+                        target_angle = 25
                         lcd.set_message("PLASTIC BOTTLE", lcd.LCD_LINE_1)
                         lcd.set_message("REMOVE CAP&LABEL", lcd.LCD_LINE_2)
-                        print("가이드: [플라스틱] -> 35도 각도로 배출합니다.")
+                        print("가이드: [플라스틱] -> 25도 각도로 배출합니다.")
                     elif success_item_name == "metal":
                         target_angle = 75
                         lcd.set_message("CAN & METAL WST", lcd.LCD_LINE_1)
@@ -1190,19 +1190,19 @@ def main():
                         lcd.set_message("REMOVE TAPE&FOLD", lcd.LCD_LINE_2)
                         print("가이드: [종이/박스류] -> 105도 각도로 배출합니다.")
                     elif success_item_name in ["vidrio", "organico"]:
-                        target_angle = 145
+                        target_angle = 155
                         if success_item_name == "vidrio":
                             lcd.set_message("GLASS BOTTLE", lcd.LCD_LINE_1)
                             lcd.set_message("RINSE WITH WATER", lcd.LCD_LINE_2)
                         else:
                             lcd.set_message("ORGANIC WASTE", lcd.LCD_LINE_1)
                             lcd.set_message("DRAIN WATER OUT", lcd.LCD_LINE_2)
-                        print(f"가이드: [{success_item_name}] -> 145도 각도로 배출합니다.")
+                        print(f"가이드: [{success_item_name}] -> 155도 각도로 배출합니다.")
                     else:
-                        target_angle = 145
+                        target_angle = 155
                         lcd.set_message("GENERAL TRASH", lcd.LCD_LINE_1)
                         lcd.set_message("STANDARD DISPOSE", lcd.LCD_LINE_2)
-                        print("가이드: [일반쓰레기] -> 145도 각도로 배출합니다.")
+                        print("가이드: [일반쓰레기] -> 155도 각도로 배출합니다.")
 
                     debug_print(
                         "SERVO",
@@ -1212,7 +1212,9 @@ def main():
                     # 4단계: 쓰레기 분류 결과 및 모터 서보 구동 각도를 SQLite3 데이터베이스에 로깅 (신뢰도 포함)
                     log_waste_event(success_item_name, target_angle, success_confidence)
 
-                    # 입구를 열기 전에 아래 분류 판을 먼저 목표 각도로 기울임 (동작 시간 약 1초 소요)
+                    # 오차를 줄이기 위해 분류 판을 0도로 먼저 보낸 뒤 목표 각도로 이동
+                    debug_print("SERVO", "목표 각도 이동 전 0도로 기준 복귀")
+                    servo.set_angle(0, duration=1.0)
                     push_console(f"[INFO] servo angle set to {target_angle} deg")
                     servo.set_angle(target_angle, duration=1.0)
 
@@ -1227,15 +1229,16 @@ def main():
                     lcd.clear()
                     lcd.set_message("PLACE WASTE FIRST", lcd.LCD_LINE_1)
                     lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
-                    print(" -> 배출 완료. 판을 기본 각도(90도)로 복귀합니다.\n")
-                    
+                    print(" -> 배출 완료. 분류 판을 0도로 복귀 후 입구를 닫습니다.\n")
+
+                    # 분류 판을 먼저 0도로 복귀
+                    debug_print("SERVO", "대기 상태 복귀 전 분류 서보 0도로 되돌림")
+                    servo.set_angle(0, duration=1.0)
+
+                    # 그다음 입구 닫기
                     debug_print("ENTRY_SERVO", "대기 모드 복귀로 입구 닫기(0도)")
                     entry_servo.set_angle(0, duration=0.8)
 
-                    # 다음 쓰레기 측정을 위해 판을 다시 수평으로 복귀
-                    debug_print("SERVO", "대기 상태 복귀 전 기본 위치(90도)로 되돌림")
-                    servo.set_angle(90, duration=1.0)
-                    
                     current_state = STATE_IDLE
                     led.set_state(STATE_IDLE)
 

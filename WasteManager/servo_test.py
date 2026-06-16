@@ -27,11 +27,11 @@ ENTRY_SERVO_PIN = 19  # 입구 개폐 서보
 
 # 분류 판 각도 프리셋 (main_final.py 의 분류 라우팅과 동일)
 PLATE_PRESETS = {
-    "plastico (플라스틱)":      35,
+    "plastico (플라스틱)":      25,
     "metal (캔/메탈)":          75,
     "papel_y_carton (종이)":    105,
-    "vidrio/organico/general": 145,
-    "기본 수평 복귀":            90,
+    "vidrio/organico/general": 155,
+    "기본 복귀 (0도)":           0,
 }
 
 # 입구 서보 각도 프리셋

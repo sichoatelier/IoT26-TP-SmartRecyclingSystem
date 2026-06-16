@@ -9,7 +9,7 @@ import requests
 import gpiod
 from gpiod.line import Direction, Value
 from smbus2 import SMBus
-from flask import Flask, jsonify, render_template_string  # Flask 백엔드 모듈 임포트
+from flask import Flask, jsonify, render_template_string, request  # Flask 백엔드 모듈 임포트
 
 # ==========================================
 # 1. 시스템 상태 기계 (State Machine) 상태 정의
@@ -67,6 +67,25 @@ def debug_print(tag, message):
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}][{tag}] {message}", flush=True)
 
 # ==========================================
+# 서버 콘솔 로그 버퍼 (웹 대시보드 터미널 카드용)
+# ==========================================
+_console_lock = threading.Lock()
+_console_lines = []      # 최근 콘솔 라인 버퍼
+_console_base = 0        # _console_lines[0]의 전역 스트림 인덱스
+_CONSOLE_MAX = 400       # 메모리 상한 (초과 시 앞에서 잘라냄)
+
+def push_console(text):
+    """웹 대시보드 터미널 카드(/api/console_log)에 표시할 서버 로그 한 줄을 적재"""
+    global _console_base
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {text}"
+    with _console_lock:
+        _console_lines.append(line)
+        if len(_console_lines) > _CONSOLE_MAX:
+            drop = len(_console_lines) - _CONSOLE_MAX
+            del _console_lines[:drop]
+            _console_base += drop
+
+# ==========================================
 # 3. SQLite3 데이터베이스 및 테이블 초기화 (4단계)
 # ==========================================
 def init_db():
@@ -92,9 +111,15 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             waste_type TEXT,
-            servo_angle INTEGER
+            servo_angle INTEGER,
+            confidence REAL
         )
     ''')
+    # 기존 DB 호환: confidence 컬럼이 없으면 추가
+    try:
+        cursor.execute("ALTER TABLE waste_logs ADD COLUMN confidence REAL")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
     debug_print("DATABASE", "SQLite3 파일 데이터베이스 스키마 초기화 완료")
@@ -435,15 +460,15 @@ def calculate_hygiene_and_log(temperature, humidity):
     return discomfort_index, hygiene_status
 
 
-def log_waste_event(waste_type, servo_angle):
+def log_waste_event(waste_type, servo_angle, confidence=None):
     """AIoT 배출 성공 시 쓰레기 이벤트 내역을 waste_logs 테이블에 적재합니다."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO waste_logs (waste_type, servo_angle)
-            VALUES (?, ?)
-        ''', (waste_type, servo_angle))
+            INSERT INTO waste_logs (waste_type, servo_angle, confidence)
+            VALUES (?, ?, ?)
+        ''', (waste_type, servo_angle, confidence))
         conn.commit()
         conn.close()
         debug_print("LOG_DB", f"쓰레기 배출 로그 적재 완료: {waste_type} (서보 각도: {servo_angle}도)")
@@ -524,8 +549,8 @@ def get_status():
         cursor.execute("SELECT timestamp, temperature, humidity, discomfort_index, hygiene_status FROM env_logs ORDER BY id DESC LIMIT 1")
         env_row = cursor.fetchone()
         
-        # 2. 최근 5개 배출 이력 조회
-        cursor.execute("SELECT timestamp, waste_type, servo_angle FROM waste_logs ORDER BY id DESC LIMIT 5")
+        # 2. 최근 배출 이력 조회 (신뢰도 포함)
+        cursor.execute("SELECT timestamp, waste_type, servo_angle, confidence FROM waste_logs ORDER BY id DESC LIMIT 12")
         waste_rows = cursor.fetchall()
         
         # 3. 종류별 누적 배출 통계 카운트 계산
@@ -538,34 +563,40 @@ def get_status():
         
         conn.close()
         
+        # 불쾌지수(DI)를 0~100 위생 위험 지수로 선형 변환 (DI 60→0, 85→100, clamp)
+        di = env_row[3] if env_row else 0.0
+        risk = 0
+        if env_row and di:
+            risk = max(0, min(100, int(round((di - 60.0) / 25.0 * 100))))
+
         # JSON 포맷 바인딩
         current_env = {
             "time": env_row[0].split()[-1] if env_row else "N/A",
             "temperature": env_row[1] if env_row else 0.0,
             "humidity": env_row[2] if env_row else 0.0,
-            "discomfort_index": env_row[3] if env_row else 0.0,
+            "risk": risk,
+            "discomfort_index": di,
             "hygiene_status": env_row[4] if env_row else "Unknown"
         }
-        
+
         recent_wastes = []
         for r in waste_rows:
             # 타임스탬프에서 시:분:초만 분리
             t_str = r[0].split()[-1] if ' ' in r[0] else r[0]
+            # confidence(0~1)는 퍼센트로 변환, 없으면 None (프론트에서 angle fallback)
+            conf_pct = round(r[3] * 100, 1) if r[3] is not None else None
             recent_wastes.append({
                 "time": t_str,
                 "type": r[1],
-                "angle": r[2]
+                "angle": r[2],
+                "confidence": conf_pct
             })
-            
-        # 통계 초기화
-        stats = {"plastico": 0, "metal": 0, "papel_y_carton": 0, "vidrio": 0, "organico": 0, "general": 0}
+
+        # 종류별 원시 누적 통계 (프론트의 classifyType()이 4개 버킷으로 폴딩)
+        stats = {}
         for s in stat_rows:
-            key = s[0]
-            if key in stats:
-                stats[key] = s[1]
-            else:
-                stats["general"] += s[1]
-                
+            stats[s[0]] = s[1]
+
         return jsonify({
             "env": current_env,
             "recent": recent_wastes,
@@ -576,344 +607,404 @@ def get_status():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# 단일 웹 대시보드 렌더링용 Tailwind HTML 소스 템플릿
+# REST API 엔드포인트: 서버 터미널 로그 증분 스트림 (대시보드 터미널 카드용)
+@flask_app.route('/api/console_log')
+def get_console_log():
+    """since 인덱스 이후의 새 콘솔 라인만 반환. 응답: {lines, next_index}"""
+    try:
+        since = int(request.args.get('since', 0))
+    except (TypeError, ValueError):
+        since = 0
+    with _console_lock:
+        next_index = _console_base + len(_console_lines)
+        start = since - _console_base
+        if start < 0:
+            start = 0
+        lines = _console_lines[start:]
+    return jsonify({"lines": lines, "next_index": next_index})
+
+
+# 단일 웹 대시보드 렌더링용 HTML 소스 템플릿 (Linear 다크 테마)
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gachon AIoT Smart Recycling 관제 센터</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <title>AIoT 스마트 분리수거 모니터</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;600;700&display=swap');
-        body { font-family: 'Pretendard', sans-serif; }
+        *{box-sizing:border-box}
+        html,body{margin:0;padding:0;background:#010102}
+        ::-webkit-scrollbar{width:8px;height:8px}
+        ::-webkit-scrollbar-thumb{background:#23252a;border-radius:9999px}
+        ::-webkit-scrollbar-track{background:transparent}
+        @keyframes livepulse{0%,100%{opacity:1}50%{opacity:0.35}}
+        .root{min-height:100vh;background:#010102;font-family:'Inter',-apple-system,system-ui,sans-serif;color:#f7f8f8;padding:26px 32px 40px}
+        .wrap{max-width:1320px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
+        .card{background:#0c0d10;border:1px solid #1d1f24;border-radius:12px;box-shadow:inset 0 1px 0 rgba(255,255,255,0.045)}
+        .clabel{font-size:11px;font-weight:600;letter-spacing:0.6px;text-transform:uppercase;color:#8a8f98}
+        .chip{font-size:10px;font-weight:500;letter-spacing:0.3px;color:#8a8f98;border:1px solid #23252a;border-radius:9999px;padding:2px 8px;font-family:'JetBrains Mono',monospace}
+        .metric{font-size:40px;font-weight:600;letter-spacing:-1.5px;line-height:1;color:#f7f8f8}
+        .unit{font-size:16px;font-weight:500;color:#8a8f98}
+        .head-row{display:flex;align-items:center;justify-content:space-between}
+        .row4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+        .row3{display:grid;grid-template-columns:0.82fr 1.3fr 1.3fr;gap:16px;align-items:stretch}
+        .mono{font-family:'JetBrains Mono',monospace}
+        @media (max-width:1080px){.row4{grid-template-columns:repeat(2,1fr)}.row3{grid-template-columns:1fr}}
     </style>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen">
+<body>
+<div class="root">
+  <div class="wrap">
 
-    <!-- Gachon University Header Banner -->
-    <header class="bg-gradient-to-r from-blue-950 via-slate-900 to-indigo-950 border-b border-indigo-950 px-6 py-4 shadow-xl">
-        <div class="max-w-7xl mx-auto flex flex-col sm:flex-row justify-between items-center gap-3">
-            <div class="flex items-center gap-3">
-                <span class="text-3xl">♻️</span>
-                <div>
-                    <h1 class="text-xl font-bold tracking-tight text-white">AIoT 스마트 분리수거 로컬 관제 센터</h1>
-                    <p class="text-xs text-indigo-300 font-semibold">Gachon University • IoT26 Spring 2026</p>
-                </div>
-            </div>
-            <div class="flex items-center gap-2 text-xs bg-indigo-950/70 border border-indigo-500/30 px-3.5 py-1.5 rounded-full text-indigo-300">
-                <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                <span class="font-medium">스레드 2: Flask 로컬 웹 서버 가동 중 [Port 5000]</span>
-            </div>
+    <header class="head-row" style="padding-bottom:2px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div style="width:30px;height:30px;border-radius:8px;background:#5e6ad2;display:flex;align-items:center;justify-content:center;box-shadow:inset 0 1px 0 rgba(255,255,255,0.22)">
+          <div style="width:13px;height:13px;border:2px solid #fff;border-radius:4px;transform:rotate(45deg)"></div>
         </div>
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <span style="font-size:16px;font-weight:600;letter-spacing:-0.4px;color:#f7f8f8">AIoT 스마트 분리수거 모니터</span>
+          <span style="font-size:12px;color:#8a8f98;letter-spacing:-0.1px">실시간 위생 · 배출 대시보드</span>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:14px">
+        <div style="display:flex;align-items:center;gap:7px;background:#0c0d10;border:1px solid #1d1f24;border-radius:9999px;padding:6px 12px">
+          <span id="conn-dot" style="width:8px;height:8px;border-radius:9999px;background:#62666d"></span>
+          <span id="conn-text" style="color:#8a8f98;font-size:12px;font-weight:500">연결 끊김</span>
+        </div>
+        <span id="clock" class="mono" style="font-size:13px;color:#8a8f98;min-width:80px;text-align:right">--:--:--</span>
+      </div>
     </header>
 
-    <main class="max-w-7xl mx-auto px-4 py-8">
-        
-        <!-- 실시간 위생 지수 및 상태 대시보드 카드 -->
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-            
-            <!-- 카드 1: 위생 위험 지수 -->
-            <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-6 shadow-md transition hover:border-indigo-500">
-                <div class="flex justify-between items-center mb-3">
-                    <span class="text-xs text-slate-400 font-bold uppercase tracking-wider">위생 위험 불쾌지수</span>
-                    <span class="p-2 bg-indigo-500/10 text-indigo-400 rounded-lg text-sm"><i class="fa-solid fa-chart-line"></i></span>
-                </div>
-                <div class="flex items-baseline gap-1.5">
-                    <span id="discomfort-val" class="text-4xl font-extrabold text-white">0.0</span>
-                    <span class="text-sm text-slate-400">DI</span>
-                </div>
-                <div class="w-full bg-slate-800 h-2 rounded-full mt-4 overflow-hidden">
-                    <div id="discomfort-bar" class="bg-indigo-500 h-2 rounded-full transition-all duration-1000" style="width: 0%"></div>
-                </div>
-                <p id="di-advice" class="text-xxs text-slate-400 mt-2">상태를 수집 중입니다...</p>
-            </div>
+    <div class="row4">
 
-            <!-- 카드 2: 위생 상태 등급 -->
-            <div id="status-card" class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-6 shadow-md transition">
-                <div class="flex justify-between items-center mb-3">
-                    <span class="text-xs text-slate-400 font-bold uppercase tracking-wider">위생 관리 상태</span>
-                    <span class="p-2 bg-emerald-500/10 text-emerald-400 rounded-lg text-sm"><i class="fa-solid fa-shield-virus"></i></span>
-                </div>
-                <div class="flex items-center gap-2">
-                    <span id="status-val" class="text-3xl font-extrabold text-white">None</span>
-                </div>
-                <div class="w-full bg-slate-800 h-2 rounded-full mt-4 overflow-hidden">
-                    <div id="status-bar" class="bg-emerald-500 h-2 rounded-full transition-all duration-1000" style="width: 0%"></div>
-                </div>
-                <p id="status-advice" class="text-xxs text-slate-400 mt-2">안정적인 상태가 유지 중입니다.</p>
-            </div>
-
-            <!-- 카드 3: 위생 센서 온도 -->
-            <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-6 shadow-md transition hover:border-rose-500">
-                <div class="flex justify-between items-center mb-3">
-                    <span class="text-xs text-slate-400 font-bold uppercase tracking-wider">쓰레기통 온도</span>
-                    <span class="p-2 bg-rose-500/10 text-rose-400 rounded-lg text-sm"><i class="fa-solid fa-thermometer-half"></i></span>
-                </div>
-                <div class="flex items-baseline gap-1">
-                    <span id="temp-val" class="text-4xl font-extrabold text-white">0.0</span>
-                    <span class="text-sm text-slate-400">°C</span>
-                </div>
-                <div class="w-full bg-slate-800 h-2 rounded-full mt-4 overflow-hidden">
-                    <div id="temp-bar" class="bg-rose-500 h-2 rounded-full transition-all duration-1000" style="width: 0%"></div>
-                </div>
-                <p class="text-xxs text-slate-400 mt-2">DHT11 센서 실시간 수집 결과</p>
-            </div>
-
-            <!-- 카드 4: 위생 센서 습도 -->
-            <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-6 shadow-md transition hover:border-sky-500">
-                <div class="flex justify-between items-center mb-3">
-                    <span class="text-xs text-slate-400 font-bold uppercase tracking-wider">쓰레기통 습도</span>
-                    <span class="p-2 bg-sky-500/10 text-sky-400 rounded-lg text-sm"><i class="fa-solid fa-droplet"></i></span>
-                </div>
-                <div class="flex items-baseline gap-1">
-                    <span id="hum-val" class="text-4xl font-extrabold text-white">0.0</span>
-                    <span class="text-sm text-slate-400">%</span>
-                </div>
-                <div class="w-full bg-slate-800 h-2 rounded-full mt-4 overflow-hidden">
-                    <div id="hum-bar" class="bg-sky-500 h-2 rounded-full transition-all duration-1000" style="width: 0%"></div>
-                </div>
-                <p class="text-xxs text-slate-400 mt-2">악취 및 곰팡이 유발 지표 모니터링</p>
-            </div>
-            
+      <div class="card" style="padding:18px 18px 14px;display:flex;flex-direction:column;gap:10px;min-height:198px">
+        <div class="head-row"><span class="clabel">온도</span><span class="chip">최근 10회</span></div>
+        <div style="display:flex;align-items:baseline;gap:4px">
+          <span class="metric" id="temp-val">--</span><span class="unit">°C</span>
         </div>
+        <div style="position:relative;height:74px;margin-top:auto"><canvas id="temp-chart"></canvas></div>
+      </div>
 
-        <!-- 메인 데이터 그리드 (좌측: 누적 분리수거 통계, 우측: 최근 실시간 배출 로그) -->
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            
-            <!-- 좌측 2/3 영역: 누적 처리수 및 통계 -->
-            <div class="lg:col-span-2 space-y-8">
-                
-                <!-- 누적 쓰레기 수집 통계 -->
-                <div class="bg-slate-900/40 border border-slate-900 rounded-2xl p-6">
-                    <div class="flex justify-between items-center mb-6">
-                        <h2 class="text-lg font-bold text-white flex items-center gap-2">
-                            <span class="w-1.5 h-4 bg-indigo-500 rounded-full"></span>
-                            카테고리별 누적 분리배출 현황
-                        </h2>
-                        <div class="bg-slate-800/50 border border-slate-700/50 px-3.5 py-1.5 rounded-xl text-right">
-                            <span class="text-xxs text-slate-400 block font-semibold">총 분리배출 처리 건수</span>
-                            <span id="total-cnt-val" class="text-lg font-extrabold text-indigo-400">0건</span>
-                        </div>
-                    </div>
-                    
-                    <div class="grid grid-cols-2 sm:grid-cols-3 gap-4">
-                        <!-- 플라스틱 -->
-                        <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-                            <div class="flex justify-between text-xs text-slate-400 mb-2 font-semibold">
-                                <span>🥤 플라스틱</span>
-                                <span id="stat-plastic-cnt" class="text-indigo-400 font-bold">0건</span>
-                            </div>
-                            <div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                                <div id="stat-plastic-bar" class="bg-indigo-500 h-1.5 transition-all duration-1000" style="width: 0%"></div>
-                            </div>
-                        </div>
-                        <!-- 캔/메탈 -->
-                        <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-                            <div class="flex justify-between text-xs text-slate-400 mb-2 font-semibold">
-                                <span>🥫 캔 / 메탈</span>
-                                <span id="stat-metal-cnt" class="text-rose-400 font-bold">0건</span>
-                            </div>
-                            <div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                                <div id="stat-metal-bar" class="bg-rose-500 h-1.5 transition-all duration-1000" style="width: 0%"></div>
-                            </div>
-                        </div>
-                        <!-- 종이 -->
-                        <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-                            <div class="flex justify-between text-xs text-slate-400 mb-2 font-semibold">
-                                <span>📦 종이류</span>
-                                <span id="stat-paper-cnt" class="text-amber-400 font-bold">0건</span>
-                            </div>
-                            <div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                                <div id="stat-paper-bar" class="bg-amber-500 h-1.5 transition-all duration-1000" style="width: 0%"></div>
-                            </div>
-                        </div>
-                        <!-- 유리 -->
-                        <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-                            <div class="flex justify-between text-xs text-slate-400 mb-2 font-semibold">
-                                <span>🍾 유리병</span>
-                                <span id="stat-glass-cnt" class="text-emerald-400 font-bold">0건</span>
-                            </div>
-                            <div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                                <div id="stat-glass-bar" class="bg-emerald-500 h-1.5 transition-all duration-1000" style="width: 0%"></div>
-                            </div>
-                        </div>
-                        <!-- 유기물 -->
-                        <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-                            <div class="flex justify-between text-xs text-slate-400 mb-2 font-semibold">
-                                <span>🍎 음식물</span>
-                                <span id="stat-organic-cnt" class="text-teal-400 font-bold">0건</span>
-                            </div>
-                            <div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                                <div id="stat-organic-bar" class="bg-teal-500 h-1.5 transition-all duration-1000" style="width: 0%"></div>
-                            </div>
-                        </div>
-                        <!-- 일반 -->
-                        <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-                            <div class="flex justify-between text-xs text-slate-400 mb-2 font-semibold">
-                                <span>🗑️ 일반쓰레기</span>
-                                <span id="stat-general-cnt" class="text-slate-400 font-bold">0건</span>
-                            </div>
-                            <div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                                <div id="stat-general-bar" class="bg-slate-500 h-1.5 transition-all duration-1000" style="width: 0%"></div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-            </div>
-
-            <!-- 우측 1/3 영역: 최근 실시간 배출 로그 이력 -->
-            <div class="bg-slate-900/40 border border-slate-900 rounded-2xl p-6 flex flex-col h-full">
-                <h2 class="text-lg font-bold text-white mb-6 flex items-center gap-2">
-                    <span class="w-1.5 h-4 bg-sky-500 rounded-full"></span>
-                    최근 쓰레기 배출 로그 (SQLite3)
-                </h2>
-                
-                <div class="flex-1 space-y-4 max-h-[350px] overflow-y-auto pr-1" id="recent-logs-container">
-                    <div class="text-center py-12 text-slate-500 text-sm">연결을 확인하는 중입니다...</div>
-                </div>
-            </div>
-
+      <div class="card" style="padding:18px 18px 14px;display:flex;flex-direction:column;gap:10px;min-height:198px">
+        <div class="head-row"><span class="clabel">습도</span><span class="chip">최근 10회</span></div>
+        <div style="display:flex;align-items:baseline;gap:4px">
+          <span class="metric" id="hum-val">--</span><span class="unit">%</span>
         </div>
-    </main>
+        <div style="position:relative;height:74px;margin-top:auto"><canvas id="hum-chart"></canvas></div>
+      </div>
 
-    <footer class="mt-20 border-t border-slate-900 py-6 text-center text-xs text-slate-600">
-        <p>© 2026 Gachon University Prof. Jaehyuk Choi - Spring 2026 AIoT Team Project</p>
-    </footer>
+      <div class="card" style="padding:18px;display:flex;flex-direction:column;gap:12px;min-height:198px">
+        <div class="head-row"><span class="clabel">위생 위험 지수</span><span class="chip">0–100</span></div>
+        <div style="display:flex;align-items:baseline;gap:5px">
+          <span class="metric" id="risk-val">--</span><span style="font-size:15px;font-weight:500;color:#8a8f98">/ 100</span>
+        </div>
+        <div style="margin-top:auto;display:flex;flex-direction:column;gap:10px">
+          <div style="height:8px;border-radius:9999px;background:#1c1d20;overflow:hidden">
+            <div id="risk-bar" style="width:0%;height:100%;background:#27a644;border-radius:9999px;transition:width .4s ease,background .4s ease"></div>
+          </div>
+          <div style="display:flex;align-items:center;gap:7px">
+            <span id="risk-dot" style="width:8px;height:8px;border-radius:9999px;background:#27a644"></span>
+            <span id="risk-status" style="color:#27a644;font-size:13px;font-weight:600">--</span>
+            <span id="risk-hint" class="mono" style="font-size:12px;color:#62666d;margin-left:auto">--</span>
+          </div>
+        </div>
+      </div>
 
-    <!-- 실시간 상태 데이터 Fetching & 화면 업데이트 로직 -->
-    <script>
-        function updateDashboard() {
-            fetch('/api/status')
-                .then(response => response.json())
-                .then(data => {
-                    const env = data.env;
-                    
-                    // 1. 온습도 갱신
-                    document.getElementById('temp-val').textContent = env.temperature.toFixed(1);
-                    document.getElementById('temp-bar').style.width = Math.min((env.temperature / 45) * 100, 100) + '%';
-                    
-                    document.getElementById('hum-val').textContent = env.humidity.toFixed(1);
-                    document.getElementById('hum-bar').style.width = env.humidity + '%';
+      <div class="card" style="padding:18px;display:flex;flex-direction:column;gap:12px;min-height:198px">
+        <div class="head-row"><span class="clabel">위생 상태 등급</span><span class="chip" id="grade-chip">청결도 --</span></div>
+        <div style="display:flex;align-items:baseline;gap:8px">
+          <span id="grade-val" style="font-size:40px;font-weight:700;letter-spacing:-1px;line-height:1;color:#27a644">-</span>
+          <span id="grade-status" style="font-size:15px;font-weight:600;color:#27a644">--</span>
+        </div>
+        <div style="margin-top:auto;display:flex;flex-direction:column;gap:8px">
+          <div style="height:8px;border-radius:9999px;background:#1c1d20;overflow:hidden">
+            <div id="grade-bar" style="width:0%;height:100%;background:#27a644;border-radius:9999px;transition:width .4s ease,background .4s ease"></div>
+          </div>
+          <span class="mono" style="font-size:12px;color:#62666d">청결도 점수 · 100점 만점</span>
+        </div>
+      </div>
 
-                    // 2. 불쾌지수(DI) 갱신
-                    document.getElementById('discomfort-val').textContent = env.discomfort_index.toFixed(1);
-                    document.getElementById('discomfort-bar').style.width = Math.min((env.discomfort_index / 100) * 100, 100) + '%';
-                    
-                    const diAdvice = document.getElementById('di-advice');
-                    if(env.discomfort_index >= 75) {
-                        diAdvice.innerHTML = "위생 위험 지수가 높습니다. 환기 권장.";
-                        diAdvice.className = "text-xxs text-rose-400 mt-2 font-semibold animate-pulse";
-                    } else if(env.discomfort_index >= 68) {
-                        diAdvice.innerHTML = "악취 우려가 시작되는 구간입니다.";
-                        diAdvice.className = "text-xxs text-amber-400 mt-2";
-                    } else {
-                        diAdvice.innerHTML = "안정적이고 쾌적한 내부 수거 상태입니다.";
-                        diAdvice.className = "text-xxs text-slate-400 mt-2";
-                    }
+    </div>
 
-                    // 3. 위생 상태 등급 갱신
-                    const statusCard = document.getElementById('status-card');
-                    const statusVal = document.getElementById('status-val');
-                    const statusBar = document.getElementById('status-bar');
-                    const statusAdvice = document.getElementById('status-advice');
-                    
-                    statusVal.textContent = env.hygiene_status;
-                    
-                    if(env.hygiene_status === "Warning") {
-                        statusCard.className = "bg-rose-950/20 border border-rose-800 rounded-2xl p-6 shadow-md transition";
-                        statusBar.className = "bg-rose-500 h-2 rounded-full transition-all duration-1000";
-                        statusBar.style.width = "100%";
-                        statusAdvice.textContent = "🚨 세균 및 바이러스 발생 번식 지수가 매우 높아 소독이 필요합니다.";
-                        statusAdvice.className = "text-xxs text-rose-400 mt-2 font-semibold";
-                    } else if(env.hygiene_status === "Caution") {
-                        statusCard.className = "bg-amber-950/20 border border-amber-800 rounded-2xl p-6 shadow-md transition";
-                        statusBar.className = "bg-amber-500 h-2 rounded-full transition-all duration-1000";
-                        statusBar.style.width = "65%";
-                        statusAdvice.textContent = "⚠️ 습기로 인한 악취 유발 가능성이 있습니다.";
-                        statusAdvice.className = "text-xxs text-amber-400 mt-2";
-                    } else {
-                        statusCard.className = "bg-slate-900/60 border border-slate-800/80 rounded-2xl p-6 shadow-md transition hover:border-emerald-500";
-                        statusBar.className = "bg-emerald-500 h-2 rounded-full transition-all duration-1000";
-                        statusBar.style.width = "30%";
-                        statusAdvice.textContent = "✅ 내부 세균 우려가 없는 청결한 상태입니다.";
-                        statusAdvice.className = "text-xxs text-emerald-400 mt-2";
-                    }
+    <div class="row3">
 
-                    // 4. 총 배출 건수 갱신
-                    document.getElementById('total-cnt-val').textContent = data.total_count + '건';
+      <div class="card" style="padding:18px;display:flex;flex-direction:column;gap:12px;height:432px">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between">
+          <div style="display:flex;flex-direction:column;gap:3px">
+            <span class="clabel">실시간 배출 로그</span>
+            <span style="font-size:12px;color:#62666d">최근 분류 결과</span>
+          </div>
+          <span class="mono" style="display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;color:#27a644">
+            <span style="width:7px;height:7px;border-radius:9999px;background:#27a644;animation:livepulse 1.6s ease-in-out infinite"></span>LIVE
+          </span>
+        </div>
+        <div id="log-list" style="flex:1;overflow-y:auto;margin:0 -4px;padding:0 4px"></div>
+      </div>
 
-                    // 5. 종류별 통계 프로그레스바 갱신 (비율 연산)
-                    updateStatBlock('plastic', data.stats.plastico, data.total_count);
-                    updateStatBlock('metal', data.stats.metal, data.total_count);
-                    updateStatBlock('paper', data.stats.papel_y_carton, data.total_count);
-                    updateStatBlock('glass', data.stats.vidrio, data.total_count);
-                    updateStatBlock('organic', data.stats.organico, data.total_count);
-                    updateStatBlock('general', data.stats.general, data.total_count);
+      <div class="card" style="padding:18px;display:flex;flex-direction:column;gap:14px;height:432px">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between">
+          <div style="display:flex;flex-direction:column;gap:3px">
+            <span class="clabel">누적 배출 히스토그램</span>
+            <span style="font-size:12px;color:#62666d">분류별 누적 처리량</span>
+          </div>
+          <span id="total-badge" class="mono" style="font-size:12px;font-weight:600;color:#d0d6e0;background:#141517;border:1px solid #23252a;border-radius:9999px;padding:4px 12px">총 0건</span>
+        </div>
+        <div style="position:relative;flex:1;min-height:0"><canvas id="bar-chart"></canvas></div>
+        <div style="display:flex;flex-wrap:wrap;gap:14px 18px">
+          <div style="display:flex;align-items:center;gap:6px"><span style="width:9px;height:9px;border-radius:3px;background:#4ea7fc"></span><span style="font-size:12px;color:#8a8f98">🥤 플라스틱</span></div>
+          <div style="display:flex;align-items:center;gap:6px"><span style="width:9px;height:9px;border-radius:3px;background:#e6a23c"></span><span style="font-size:12px;color:#8a8f98">🥫 캔</span></div>
+          <div style="display:flex;align-items:center;gap:6px"><span style="width:9px;height:9px;border-radius:3px;background:#27a644"></span><span style="font-size:12px;color:#8a8f98">📦 종이</span></div>
+          <div style="display:flex;align-items:center;gap:6px"><span style="width:9px;height:9px;border-radius:3px;background:#8a8f98"></span><span style="font-size:12px;color:#8a8f98">🗑️ 일반쓰레기</span></div>
+        </div>
+      </div>
 
-                    // 6. 실시간 배출 로그 피드백 갱신
-                    const logsContainer = document.getElementById('recent-logs-container');
-                    logsContainer.innerHTML = '';
-                    
-                    if (data.recent.length === 0) {
-                        logsContainer.innerHTML = '<div class="text-center text-slate-600 py-12 text-xs">배출 기록이 존재하지 않습니다.</div>';
-                    } else {
-                        data.recent.forEach(log => {
-                            const emoji = getEmoji(log.type);
-                            const badgeColor = getBadgeColor(log.type);
-                            
-                            const itemHTML = `
-                                <div class="bg-slate-900 border border-slate-800/60 p-3 rounded-xl flex justify-between items-center transition hover:border-slate-700">
-                                    <div class="flex items-center gap-3">
-                                        <span class="text-xl">${emoji}</span>
-                                        <div>
-                                            <div class="text-xs font-bold text-white uppercase">${log.type.replace('_', ' ')}</div>
-                                            <div class="text-[10px] text-slate-500">${log.time}</div>
-                                        </div>
-                                    </div>
-                                    <div class="text-right">
-                                        <span class="inline-block px-2 py-1 text-[10px] font-bold rounded ${badgeColor}">${log.angle}도 지향</span>
-                                    </div>
-                                </div>
-                            `;
-                            logsContainer.innerHTML += itemHTML;
-                        });
-                    }
-                })
-                .catch(err => console.error("통신 장애 발생:", err));
+      <div class="card" style="display:flex;flex-direction:column;height:432px;overflow:hidden">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:11px 14px;border-bottom:1px solid #1d1f24;background:#141517">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div style="display:flex;gap:7px">
+              <span style="width:11px;height:11px;border-radius:9999px;background:#ed6a5e"></span>
+              <span style="width:11px;height:11px;border-radius:9999px;background:#f4bf4f"></span>
+              <span style="width:11px;height:11px;border-radius:9999px;background:#61c554"></span>
+            </div>
+            <span class="mono" style="font-size:12px;color:#8a8f98">server_terminal — bash</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span id="term-dot" style="width:8px;height:8px;border-radius:9999px;background:#62666d"></span>
+            <span id="term-conn" class="mono" style="font-size:11px;color:#8a8f98">연결 끊김</span>
+          </div>
+        </div>
+        <div id="console-body" style="flex:1;overflow-y:auto;background:#060708;padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.55"></div>
+      </div>
+
+    </div>
+
+  </div>
+</div>
+
+<script>
+  // 4개 분류 표시 메타 (디자인 핸드오프 사양)
+  var CAT = {
+    plastic: { emoji: '🥤', label: '플라스틱',   color: '#4ea7fc' },
+    can:     { emoji: '🥫', label: '캔',         color: '#e6a23c' },
+    paper:   { emoji: '📦', label: '종이',       color: '#27a644' },
+    general: { emoji: '🗑️', label: '일반쓰레기', color: '#8a8f98' }
+  };
+
+  // 서버 응답 log.type 원시값을 4가지 분류 키로 매핑 (핸드오프 규칙과 동일)
+  function classifyType(raw) {
+    var r = String(raw == null ? '' : raw).toLowerCase().trim();
+    if (r === 'plastico' || r === 'plastic') return 'plastic';
+    if (r === 'metal' || r === 'can') return 'can';
+    if (r === 'papel_y_carton' || r === 'paper') return 'paper';
+    return 'general'; // general, vidrio, organico 등 그 외 전부
+  }
+
+  // 위험 지수 → 등급/색상 매핑
+  function riskMeta(risk) {
+    if (risk < 30) return { grade: 'A', status: '양호', color: '#27a644' };
+    if (risk < 55) return { grade: 'B', status: '주의', color: '#e6a23c' };
+    if (risk < 78) return { grade: 'C', status: '경고', color: '#f2994a' };
+    return { grade: 'D', status: '위험', color: '#e5484d' };
+  }
+
+  function rgba(hex, a) {
+    var h = hex.replace('#', '');
+    if (h.length === 3) h = h.split('').map(function (c) { return c + c; }).join('');
+    var n = parseInt(h, 16);
+    return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+  }
+
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function nowStr() {
+    var d = new Date();
+    return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+
+  // 콘솔 라인 키워드 → 색상
+  function consoleColor(t) {
+    var l = t.toLowerCase();
+    if (l.indexOf('error') >= 0 || l.indexOf('traceback') >= 0 || l.indexOf('exception') >= 0) return '#e5484d';
+    if (l.indexOf('warn') >= 0) return '#e6a23c';
+    if (l.indexOf('info') >= 0) return '#4ea7fc';
+    if (l.indexOf('success') >= 0 || t.indexOf('✅') >= 0 || l.indexOf('[ok]') >= 0) return '#27a644';
+    return '#8a8f98';
+  }
+
+  var tempHistory = [], humHistory = [];
+  var tempChart, humChart, barChart;
+
+  function lineChart(canvas, color) {
+    var ctx = canvas.getContext('2d');
+    var g = ctx.createLinearGradient(0, 0, 0, 80);
+    g.addColorStop(0, rgba(color, 0.30));
+    g.addColorStop(1, rgba(color, 0));
+    return new Chart(canvas, {
+      type: 'line',
+      data: { labels: [], datasets: [{ data: [], borderColor: color, borderWidth: 2, fill: true, backgroundColor: g, tension: 0.4, pointRadius: 0 }] },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: false }, tooltip: { enabled: false } },
+        scales: {
+          x: { display: false },
+          y: { display: true, position: 'right', grid: { color: 'rgba(255,255,255,0.05)' }, border: { display: false }, ticks: { color: '#62666d', font: { size: 9 }, maxTicksLimit: 3, padding: 3 } }
         }
+      }
+    });
+  }
 
-        function updateStatBlock(idPrefix, count, total) {
-            document.getElementById(`stat-${idPrefix}-cnt`).textContent = count + '건';
-            const percent = total > 0 ? (count / total) * 100 : 0;
-            document.getElementById(`stat-${idPrefix}-bar`).style.width = percent + '%';
+  function initCharts() {
+    tempChart = lineChart(document.getElementById('temp-chart'), '#5e6ad2');
+    humChart = lineChart(document.getElementById('hum-chart'), '#4ea7fc');
+    barChart = new Chart(document.getElementById('bar-chart'), {
+      type: 'bar',
+      data: {
+        labels: ['🥤 플라스틱', '🥫 캔', '📦 종이', '🗑️ 일반'],
+        datasets: [{ data: [0, 0, 0, 0], backgroundColor: ['#4ea7fc', '#e6a23c', '#27a644', '#8a8f98'], borderRadius: 6, maxBarThickness: 72 }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: false }, tooltip: { enabled: true, backgroundColor: '#141517', borderColor: '#23252a', borderWidth: 1, titleColor: '#f7f8f8', bodyColor: '#d0d6e0', padding: 10, displayColors: false } },
+        scales: {
+          x: { grid: { display: false }, border: { display: false }, ticks: { color: '#8a8f98', font: { size: 12 } } },
+          y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.05)' }, border: { display: false }, ticks: { color: '#62666d', font: { size: 11 } } }
         }
+      }
+    });
+  }
 
-        function getEmoji(type) {
-            if (type.includes("plastic")) return '🥤';
-            if (type.includes("metal")) return '🥫';
-            if (type.includes("papel")) return '📦';
-            if (type.includes("vidrio")) return '🍾';
-            if (type.includes("organic")) return '🍎';
-            return '🗑️';
-        }
+  var connected = false;
+  function setConn(ok) {
+    connected = ok;
+    var dot = document.getElementById('conn-dot');
+    var txt = document.getElementById('conn-text');
+    var tdot = document.getElementById('term-dot');
+    var tconn = document.getElementById('term-conn');
+    var color = ok ? '#27a644' : '#62666d';
+    var label = ok ? '수신 중' : '연결 끊김';
+    var shadow = ok ? '0 0 8px rgba(39,166,68,0.6)' : 'none';
+    dot.style.background = color; dot.style.boxShadow = shadow;
+    txt.textContent = label; txt.style.color = ok ? '#27a644' : '#8a8f98';
+    tdot.style.background = color; tdot.style.boxShadow = shadow;
+    tconn.textContent = label; tconn.style.color = ok ? '#27a644' : '#8a8f98';
+  }
 
-        function getBadgeColor(type) {
-            if (type.includes("plastic")) return 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/30';
-            if (type.includes("metal")) return 'bg-rose-500/10 text-rose-400 border border-rose-500/30';
-            if (type.includes("papel")) return 'bg-amber-500/10 text-amber-400 border border-amber-500/30';
-            if (type.includes("vidrio")) return 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30';
-            if (type.includes("organic")) return 'bg-teal-500/10 text-teal-400 border border-teal-500/30';
-            return 'bg-slate-500/10 text-slate-400 border border-slate-500/30';
-        }
+  function renderLogs(recent) {
+    var list = document.getElementById('log-list');
+    if (!recent || recent.length === 0) {
+      list.innerHTML = '<div style="text-align:center;color:#5b5f66;padding:40px 0;font-size:12px">배출 기록이 없습니다.</div>';
+      return;
+    }
+    list.innerHTML = recent.map(function (r) {
+      var m = CAT[classifyType(r.type)];
+      // confidence 우선, 없으면 angle fallback
+      var conf = (r.confidence != null) ? r.confidence : r.angle;
+      var confText = '(' + Number(conf).toFixed(1) + '%)';
+      return '<div style="display:flex;flex-direction:column;gap:3px;padding:9px 0;border-bottom:1px solid #16181c">'
+        + '<div style="display:flex;align-items:baseline;gap:7px">'
+        + '<span style="font-size:15px;line-height:1">' + m.emoji + '</span>'
+        + '<span style="color:' + m.color + ';font-weight:600;font-size:14px">' + m.label + '</span>'
+        + '<span class="mono" style="font-size:12px;color:#8a8f98;opacity:0.55">' + confText + '</span>'
+        + '</div>'
+        + '<div class="mono" style="font-size:11px;color:#5b5f66;letter-spacing:0.2px">' + r.time + '</div>'
+        + '</div>';
+    }).join('');
+  }
 
-        // 3초 단위 갱신 루프 활성화
-        setInterval(updateDashboard, 3000);
-        window.onload = updateDashboard;
-    </script>
+  function updateStatus() {
+    fetch('/api/status').then(function (res) { return res.json(); }).then(function (data) {
+      setConn(true);
+      var env = data.env || {};
+      var temp = Number(env.temperature || 0);
+      var hum = Number(env.humidity || 0);
+      var risk = Math.round(Number(env.risk || 0));
+
+      document.getElementById('temp-val').textContent = temp.toFixed(1);
+      document.getElementById('hum-val').textContent = String(Math.round(hum));
+
+      // 폴링 시 히스토리에 push, 10개 초과 시 shift
+      tempHistory.push(temp); if (tempHistory.length > 10) tempHistory.shift();
+      humHistory.push(hum); if (humHistory.length > 10) humHistory.shift();
+      if (tempChart) {
+        tempChart.data.labels = tempHistory.map(function (_, i) { return i + 1; });
+        tempChart.data.datasets[0].data = tempHistory.slice();
+        tempChart.update('none');
+      }
+      if (humChart) {
+        humChart.data.labels = humHistory.map(function (_, i) { return i + 1; });
+        humChart.data.datasets[0].data = humHistory.slice();
+        humChart.update('none');
+      }
+
+      // 위험 지수 + 등급
+      var meta = riskMeta(risk);
+      var clean = Math.round(100 - risk);
+      document.getElementById('risk-val').textContent = String(risk);
+      var rb = document.getElementById('risk-bar'); rb.style.width = risk + '%'; rb.style.background = meta.color;
+      document.getElementById('risk-dot').style.background = meta.color;
+      var rs = document.getElementById('risk-status'); rs.textContent = meta.status; rs.style.color = meta.color;
+      document.getElementById('risk-hint').textContent = risk < 55 ? '안정' : '점검 필요';
+
+      var gv = document.getElementById('grade-val'); gv.textContent = meta.grade; gv.style.color = meta.color;
+      var gs = document.getElementById('grade-status'); gs.textContent = meta.status; gs.style.color = meta.color;
+      document.getElementById('grade-chip').textContent = '청결도 ' + clean;
+      var gb = document.getElementById('grade-bar'); gb.style.width = clean + '%'; gb.style.background = meta.color;
+
+      // 누적 통계 폴딩 (원시 type → 4 버킷)
+      var counts = { plastic: 0, can: 0, paper: 0, general: 0 };
+      var stats = data.stats || {};
+      Object.keys(stats).forEach(function (k) { counts[classifyType(k)] += stats[k]; });
+      if (barChart) {
+        barChart.data.datasets[0].data = [counts.plastic, counts.can, counts.paper, counts.general];
+        barChart.update('none');
+      }
+      document.getElementById('total-badge').textContent = '총 ' + Number(data.total_count || 0).toLocaleString() + '건';
+
+      renderLogs(data.recent || []);
+    }).catch(function () { setConn(false); });
+  }
+
+  var consoleIndex = 0;
+  function appendConsole(lines) {
+    var body = document.getElementById('console-body');
+    lines.forEach(function (t) {
+      var div = document.createElement('div');
+      div.textContent = t;
+      div.style.color = consoleColor(t);
+      div.style.whiteSpace = 'pre-wrap';
+      div.style.padding = '1px 0';
+      body.appendChild(div);
+    });
+    while (body.childElementCount > 200) body.removeChild(body.firstChild);
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function updateConsole() {
+    fetch('/api/console_log?since=' + consoleIndex).then(function (res) { return res.json(); }).then(function (data) {
+      if (data.lines && data.lines.length) appendConsole(data.lines);
+      if (typeof data.next_index === 'number') consoleIndex = data.next_index;
+    }).catch(function () {});
+  }
+
+  function start() {
+    if (typeof Chart !== 'undefined') {
+      initCharts();
+      document.getElementById('clock').textContent = nowStr();
+      updateStatus();
+      updateConsole();
+      setInterval(updateStatus, 2000);
+      setInterval(updateConsole, 2000);
+      setInterval(function () { document.getElementById('clock').textContent = nowStr(); }, 1000);
+    } else {
+      setTimeout(start, 120);
+    }
+  }
+  window.addEventListener('load', start);
+</script>
 </body>
 </html>
 """
@@ -942,7 +1033,11 @@ def main():
     # 5단계: Flask 웹 관제서버 백그라운드 스레드 시동
     flask_thread = threading.Thread(target=start_flask_server, daemon=True)
     flask_thread.start()
-    
+
+    push_console("[INFO] booting AIoT sorter node")
+    push_console("✅ model endpoint ready: " + API_URL)
+    push_console("[INFO] flask dashboard up @ :5000")
+
     lcd = I2CLCD(address=LCD_ADDRESS, bus_num=I2C_BUS)
     led = LEDController(CHIP_PATH, LED_PIN_R, LED_PIN_Y, LED_PIN_G, RGB_PIN_R, RGB_PIN_G, RGB_PIN_B)
     servo = ServoController(CHIP_PATH, SERVO_PIN)
@@ -965,12 +1060,14 @@ def main():
     state_entry_time = 0
     result_displayed = False
     success_item_name = ""
+    success_confidence = 0.0
     error_reason = ""
-    
+
     lcd.set_message("PLACE WASTE FIRST", lcd.LCD_LINE_1)
     lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
     print("\n상태 기계 구동 엔진 가동 중... [현재 상태: IDLE]")
     print(f" -> 통신 대상 서버: {API_URL}")
+    push_console("[INFO] polling sensors — stream open")
 
     try:
         while True:
@@ -987,13 +1084,15 @@ def main():
                         # 불쾌지수 공식 대조 및 SQLite3 env_logs 테이블 자동 적재
                         di, hygiene_status = calculate_hygiene_and_log(temp, hum)
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] 내부 온도: {temp}°C | 습도: {hum}% | 불쾌지수: {di} | 위생상태: {hygiene_status}")
+                        push_console(f"[INFO] env temp={temp}C hum={hum}% DI={di} status={hygiene_status}")
                     last_dht_time = current_time
-                
+
                 dist = get_ultrasonic_distance()
                 if 0.0 < dist <= 7.0:
                     print(f"\n[트리거 작동] {dist}cm에 사용자 감지! 카메라 캡처를 실행합니다.")
+                    push_console(f"[INFO] user detected at {dist}cm — frame capturing...")
                     current_state = STATE_SCANNING
-                    led.set_state(STATE_SCANNING) 
+                    led.set_state(STATE_SCANNING)
 
             # [상태 2] STATE_SCANNING: 촬영 및 API 서버 전송
             elif current_state == STATE_SCANNING:
@@ -1006,6 +1105,7 @@ def main():
                 
                 if not ret:
                     print(" [SYSTEM_ALERT] 카메라 이미지 프레임을 가져오지 못했습니다.")
+                    push_console("ERROR: camera capture failed")
                     current_state = STATE_RESULT_ERROR
                     led.set_state(STATE_RESULT_ERROR)
                     error_reason = "SYSTEM_FAULT"
@@ -1028,30 +1128,36 @@ def main():
                     predictions = api_result.get("predictions", [])
                     server_time = api_result.get("processing_time_sec", 0)
                     print(f" -> 서버 처리 완료 (응답시간: {server_time}초)")
+                    push_console(f"[INFO] inference done in {server_time}s")
 
                     if predictions:
                         best_pred = predictions[0]
                         detected_item = best_pred["class_name"]
                         max_conf = best_pred["confidence"]
-                        
+
                         if max_conf >= CONFIDENCE_THRESHOLD:
                             print(f" -> 탐지 성공: '{detected_item}' (신뢰도: {max_conf * 100:.1f}%)")
+                            push_console(f"✅ classified: {detected_item} conf={max_conf:.2f}")
                             current_state = STATE_RESULT_SUCCESS
                             led.set_state(STATE_RESULT_SUCCESS)
                             success_item_name = detected_item
+                            success_confidence = max_conf
                         else:
                             print(f" -> 탐지 실패: 물체를 감지했으나 신뢰도({max_conf * 100:.1f}%)가 기준 미달입니다.")
+                            push_console(f"[WARN] low confidence {max_conf * 100:.1f}% — rejected")
                             current_state = STATE_RESULT_ERROR
                             led.set_state(STATE_RESULT_ERROR)
                             error_reason = "LOW_CONFIDENCE"
                     else:
                         print(" -> 탐지 실패: 서버에서 예측 데이터가 오지 않았습니다.")
+                        push_console("[WARN] no object detected in frame")
                         current_state = STATE_RESULT_ERROR
                         led.set_state(STATE_RESULT_ERROR)
                         error_reason = "NO_OBJECT"
 
                 except requests.exceptions.RequestException as e:
                     print(f" [API_ERROR] 서버 통신 실패: {e}")
+                    push_console(f"ERROR: server request failed — {e}")
                     current_state = STATE_RESULT_ERROR
                     led.set_state(STATE_RESULT_ERROR)
                     error_reason = "SYSTEM_FAULT"
@@ -1103,10 +1209,11 @@ def main():
                         f"분류 결과 반영: success_item_name={success_item_name}, target_angle={target_angle}, state={current_state}"
                     )
 
-                    # 4단계: 쓰레기 분류 결과 및 모터 서보 구동 각도를 SQLite3 데이터베이스에 로깅
-                    log_waste_event(success_item_name, target_angle)
+                    # 4단계: 쓰레기 분류 결과 및 모터 서보 구동 각도를 SQLite3 데이터베이스에 로깅 (신뢰도 포함)
+                    log_waste_event(success_item_name, target_angle, success_confidence)
 
                     # 입구를 열기 전에 아래 분류 판을 먼저 목표 각도로 기울임 (동작 시간 약 1초 소요)
+                    push_console(f"[INFO] servo angle set to {target_angle} deg")
                     servo.set_angle(target_angle, duration=1.0)
 
                     # 판 각도 조정이 끝난 뒤 입구 개방

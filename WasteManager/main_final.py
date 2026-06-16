@@ -31,7 +31,7 @@ DHT_PIN = 17
 
 # 상태 표시 LED 핀 설정 (상태등)
 LED_PIN_R = 5
-LED_PIN_Y = 13
+LED_PIN_Y = 12
 LED_PIN_G = 6
 
 # 3색 RGB LED 핀 설정 (조명용)

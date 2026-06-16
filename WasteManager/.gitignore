@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# SQLite 데이터베이스 (런타임 생성)
+*.db
+
+# 카메라 캡처 이미지 (런타임 생성)
+captured_waste.jpg
+
+# OS
+.DS_Store

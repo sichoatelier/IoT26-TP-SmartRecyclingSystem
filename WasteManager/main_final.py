@@ -1023,6 +1023,18 @@ def start_flask_server():
 
 
 # ==========================================
+# 대기(IDLE) 화면: 온습도 + 안내 문구 표시
+# ==========================================
+def show_idle_screen(lcd, temp=None, hum=None):
+    """대기 상태 LCD: 1행에 온습도(측정 전 안내), 2행에 투입 안내"""
+    if temp is not None and hum is not None:
+        lcd.set_message(f"T:{temp:.1f}C H:{int(round(hum))}%", lcd.LCD_LINE_1)
+    else:
+        lcd.set_message("PLACE WASTE HERE", lcd.LCD_LINE_1)
+    lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
+
+
+# ==========================================
 # 9. 메인 통합 관제 및 상태 기계 구동 루프
 # ==========================================
 def main():
@@ -1062,9 +1074,10 @@ def main():
     success_item_name = ""
     success_confidence = 0.0
     error_reason = ""
+    last_temp = None      # 대기 화면에 표시할 최근 온도
+    last_hum = None       # 대기 화면에 표시할 최근 습도
 
-    lcd.set_message("PLACE WASTE FIRST", lcd.LCD_LINE_1)
-    lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
+    show_idle_screen(lcd, last_temp, last_hum)
     print("\n상태 기계 구동 엔진 가동 중... [현재 상태: IDLE]")
     print(f" -> 통신 대상 서버: {API_URL}")
     push_console("[INFO] polling sensors — stream open")
@@ -1085,6 +1098,9 @@ def main():
                         di, hygiene_status = calculate_hygiene_and_log(temp, hum)
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] 내부 온도: {temp}°C | 습도: {hum}% | 불쾌지수: {di} | 위생상태: {hygiene_status}")
                         push_console(f"[INFO] env temp={temp}C hum={hum}% DI={di} status={hygiene_status}")
+                        # 대기 화면 온습도 갱신
+                        last_temp, last_hum = temp, hum
+                        show_idle_screen(lcd, last_temp, last_hum)
                     last_dht_time = current_time
 
                 dist = get_ultrasonic_distance()
@@ -1177,31 +1193,31 @@ def main():
                     if success_item_name == "plastico":
                         target_angle = 25
                         lcd.set_message("PLASTIC BOTTLE", lcd.LCD_LINE_1)
-                        lcd.set_message("REMOVE CAP&LABEL", lcd.LCD_LINE_2)
+                        lcd.set_message("[3] REMOVE CAP&LABEL", lcd.LCD_LINE_2)
                         print("가이드: [플라스틱] -> 25도 각도로 배출합니다.")
                     elif success_item_name == "metal":
                         target_angle = 75
                         lcd.set_message("CAN & METAL WST", lcd.LCD_LINE_1)
-                        lcd.set_message("EMPTY & FLATTEN", lcd.LCD_LINE_2)
+                        lcd.set_message("[4] EMPTY & FLATTEN", lcd.LCD_LINE_2)
                         print("가이드: [캔/메탈] -> 75도 각도로 배출합니다.")
                     elif success_item_name == "papel_y_carton":
                         target_angle = 105
                         lcd.set_message("PAPER / BOX WST", lcd.LCD_LINE_1)
-                        lcd.set_message("REMOVE TAPE&FOLD", lcd.LCD_LINE_2)
+                        lcd.set_message("[2] REMOVE TAPE&FOLD", lcd.LCD_LINE_2)
                         print("가이드: [종이/박스류] -> 105도 각도로 배출합니다.")
                     elif success_item_name in ["vidrio", "organico"]:
                         target_angle = 155
                         if success_item_name == "vidrio":
                             lcd.set_message("GLASS BOTTLE", lcd.LCD_LINE_1)
-                            lcd.set_message("RINSE WITH WATER", lcd.LCD_LINE_2)
+                            lcd.set_message("[1] RINSE WITH WATER", lcd.LCD_LINE_2)
                         else:
                             lcd.set_message("ORGANIC WASTE", lcd.LCD_LINE_1)
-                            lcd.set_message("DRAIN WATER OUT", lcd.LCD_LINE_2)
+                            lcd.set_message("[1] DRAIN WATER OUT", lcd.LCD_LINE_2)
                         print(f"가이드: [{success_item_name}] -> 155도 각도로 배출합니다.")
                     else:
                         target_angle = 155
                         lcd.set_message("GENERAL TRASH", lcd.LCD_LINE_1)
-                        lcd.set_message("STANDARD DISPOSE", lcd.LCD_LINE_2)
+                        lcd.set_message("[1] STANDARD DISPOSE", lcd.LCD_LINE_2)
                         print("가이드: [일반쓰레기] -> 155도 각도로 배출합니다.")
 
                     debug_print(
@@ -1227,8 +1243,7 @@ def main():
                 # 상태 진입 후 5초 경과 시 다시 대기 상태로 복귀 (비차단)
                 if current_time - state_entry_time >= 5.0:
                     lcd.clear()
-                    lcd.set_message("PLACE WASTE FIRST", lcd.LCD_LINE_1)
-                    lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
+                    show_idle_screen(lcd, last_temp, last_hum)
                     print(" -> 배출 완료. 분류 판을 0도로 복귀 후 입구를 닫습니다.\n")
 
                     # 분류 판을 먼저 0도로 복귀
@@ -1260,8 +1275,7 @@ def main():
 
                 if current_time - state_entry_time >= 5.0:
                     lcd.clear()
-                    lcd.set_message("PLACE WASTE FIRST", lcd.LCD_LINE_1)
-                    lcd.set_message("APPROACH TO TRIG", lcd.LCD_LINE_2)
+                    show_idle_screen(lcd, last_temp, last_hum)
                     current_state = STATE_IDLE
                     led.set_state(STATE_IDLE)
 

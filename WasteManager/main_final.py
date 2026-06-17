@@ -1192,33 +1192,36 @@ def main():
                     # ----------------------------------------------------
                     if success_item_name == "plastico":
                         target_angle = 25
-                        lcd.set_message("PLASTIC BOTTLE", lcd.LCD_LINE_1)
+                        class_label = "PLASTIC"
                         lcd.set_message("[3] REMOVE CAP&LABEL", lcd.LCD_LINE_2)
                         print("가이드: [플라스틱] -> 25도 각도로 배출합니다.")
                     elif success_item_name == "metal":
                         target_angle = 75
-                        lcd.set_message("CAN & METAL WST", lcd.LCD_LINE_1)
+                        class_label = "METAL"
                         lcd.set_message("[4] EMPTY & FLATTEN", lcd.LCD_LINE_2)
                         print("가이드: [캔/메탈] -> 75도 각도로 배출합니다.")
                     elif success_item_name == "papel_y_carton":
                         target_angle = 105
-                        lcd.set_message("PAPER / BOX WST", lcd.LCD_LINE_1)
+                        class_label = "PAPER"
                         lcd.set_message("[2] REMOVE TAPE&FOLD", lcd.LCD_LINE_2)
                         print("가이드: [종이/박스류] -> 105도 각도로 배출합니다.")
                     elif success_item_name in ["vidrio", "organico"]:
                         target_angle = 155
                         if success_item_name == "vidrio":
-                            lcd.set_message("GLASS BOTTLE", lcd.LCD_LINE_1)
+                            class_label = "GLASS"
                             lcd.set_message("[1] RINSE WITH WATER", lcd.LCD_LINE_2)
                         else:
-                            lcd.set_message("ORGANIC WASTE", lcd.LCD_LINE_1)
+                            class_label = "ORGANIC"
                             lcd.set_message("[1] DRAIN WATER OUT", lcd.LCD_LINE_2)
                         print(f"가이드: [{success_item_name}] -> 155도 각도로 배출합니다.")
                     else:
                         target_angle = 155
-                        lcd.set_message("GENERAL TRASH", lcd.LCD_LINE_1)
+                        class_label = "GENERAL"
                         lcd.set_message("[1] STANDARD DISPOSE", lcd.LCD_LINE_2)
                         print("가이드: [일반쓰레기] -> 155도 각도로 배출합니다.")
+
+                    # 1행: 클래스명 + 신뢰도(%) 표시 (예: "PLASTIC 92.4%")
+                    lcd.set_message(f"{class_label} {success_confidence * 100:.1f}%", lcd.LCD_LINE_1)
 
                     debug_print(
                         "SERVO",
